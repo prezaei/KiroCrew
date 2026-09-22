@@ -249,7 +249,17 @@ def _url_payload_command(n: int) -> str:
 #: write redirect exactly as the read-only tier does, and for ``_DEVNULL_REDIR_RE``
 #: ending each discard idiom where bash ends the word, with its classes spelled out
 #: so a Unicode space or digit cannot pose as one. No verb or allowlist moved.
-_PACKAGE_LINE_BUDGET = 28_857
+#:
+#: Raised again, from 28,857, for ``exfil._blank_clickup_jws_client_id``: ClickUp's
+#: registration issues a compact-JWS ``client_id`` the JWS credential signature
+#: cannot tell from a bearer token, so its consent URL never rendered. The carve-out
+#: is pinned to ClickUp's one authorization endpoint and to a value whose header is
+#: a JOSE object whose ``alg`` fixes the signature's exact length, whose payload is
+#: not a dashboard link token, and whose segments and decoded text hold no fixed
+#: credential or bare secret. A bearer JWT elsewhere, an ``alg=none`` header with a
+#: bare secret, and a link token inside ``client_id`` stay refused. No pattern
+#: moved and no other endpoint gained an exemption.
+_PACKAGE_LINE_BUDGET = 28_933
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
