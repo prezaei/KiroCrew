@@ -249,7 +249,13 @@ def _url_payload_command(n: int) -> str:
 #: write redirect exactly as the read-only tier does, and for ``_DEVNULL_REDIR_RE``
 #: ending each discard idiom where bash ends the word, with its classes spelled out
 #: so a Unicode space or digit cannot pose as one. No verb or allowlist moved.
-_PACKAGE_LINE_BUDGET = 28_857
+#:
+#: Raised again for notification-bridge B1 rebased over main's advanced base: the two
+#: leaves added to ``_CREW_SECRET_LEAVES`` in ``paths.py`` (``notification_settings.json``
+#: and its ``notification-settings-staging`` directory) with their security rationale.
+#: Feature code and its justification comments, disjoint from main's own growth. Value
+#: set BY MEASUREMENT after the rebase, not arithmetic.
+_PACKAGE_LINE_BUDGET = 28_890
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
