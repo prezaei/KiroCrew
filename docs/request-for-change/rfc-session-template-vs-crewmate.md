@@ -151,7 +151,13 @@ Rules that follow:
   seed are gone; creating a crewmate does not list it until its thread holds a
   message (the greeting is one). A crewmate that only ran in the background is
   listed, as its conversation holds messages -- the owner's decision of
-  2026-10-09 ("就像 iMessage 一样 … 不管是谁回复的，只要有消息就要参与排序").
+  2026-10-09 ("就像 iMessage 一样 … 不管是谁回复的，只要有消息就要参与排序"). Its §3.1
+  (#19341) already puts the browser memory first, as rule 4 does; rule 4
+  replaces its fallback, the last send (`last_chat_ts`), with the thread
+  holding the newest message.
+- [rfc-mate-landing-once.md](rfc-mate-landing-once.md): the ordinary landing
+  Mate yields to is rule 4's (the remembered crewmate, then the newest
+  conversation), not the last-chatted one.
 - [rfc-crewmate-guides-and-mate.md](rfc-crewmate-guides-and-mate.md) "`default`
   stays the fallback": "Every chat with no crew picked folds into it" is replaced
   by rules 1 and 3. `default` remains the shared, undeletable crewmate on Global

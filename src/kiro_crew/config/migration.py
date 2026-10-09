@@ -20,7 +20,7 @@ from dataclasses import MISSING, asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kiro_crew.config.sections import KiroCrewAgentConfig, WorkspaceConfig
+from kiro_crew.config.sections import DEFAULT_KIRO_TEMPLATE, KiroCrewAgentConfig, WorkspaceConfig
 from kiro_crew.config.superseded_defaults import (
     LEGACY_LAZY_LOAD_ADOPTION,
     adopted_superseded_if_readable,
@@ -70,6 +70,21 @@ CONNECTIONS_UI_MIGRATION_MARKER = "connections_ui_migrated.json"
 #: generic one is not.
 MIGRATE_SKILLS_LAZY_LOAD = "skills_lazy_load"
 LAZY_LOAD_KEY = LEGACY_LAZY_LOAD_ADOPTION[0]
+
+#: Carry the template plain sessions ran before they were template sessions into
+#: ``agent.default_agent``, so an upgrade does not switch it. Two document shapes
+#: hold that template somewhere the resolver does not read: the reserved
+#: ``default`` crewmate as the roster default, bound to a template of its own
+#: (``default`` -> ``default-2``); and a picker star from a build that enrolled
+#: the chosen template as a crewmate alias (shared folder and store, no model)
+#: and pointed the top-level ``default_agent`` at it. The resolver reads
+#: ``agent.default_agent`` alone, so without this seed every agent-less session
+#: switches template on the first load of such a document. Only the template is
+#: carried: the ``default`` row's folder, store and model pin stay its own.
+#: One-shot by state: the field is UNSET in both shapes and stays set after --
+#: the star writes it directly, the stock template included, so any stored
+#: value, even ``kirocrew``, is a choice already made and the predicate is false.
+MIGRATE_STAR_DEFAULT_TEMPLATE = "star_default_template"
 
 #: The newest release line whose writes are rewritten. ``CONNECTIONS_UI_MIGRATION_MARKER``
 #: first shipped in 0.7.0 (0.7.0-insider.1) and every clean load of a later build
@@ -137,6 +152,54 @@ def legacy_lazy_load_rewrite_due(base_data: dict, *, connections_marker: Path) -
     return stamp
 
 
+def star_default_template_due(
+    stored_template: object, default_alias: object, rows: object
+) -> str | None:
+    """The template plain sessions ran before they were template sessions, when a
+    document still carries it only on the roster's default alias; ``None`` when
+    there is nothing to carry.
+
+    Always: ``agent.default_agent`` is unset (any stored value, the stock
+    template included, is a choice already made in the field: resetting the
+    star to ``kirocrew`` stores that name, and a later load must not put the
+    alias's template back); the top-level ``default_agent`` names a row; and that
+    row's template is not the stock one, which would be a no-op. Then one of:
+
+    * the alias is the reserved ``default`` crewmate. Plain sessions ran its
+      template, whatever folder, store or model it also binds; only the
+      template is carried, the rest stays the crewmate's own.
+    * the alias is a pre-rule star pick: a template-only binding (the shared
+      ``default`` folder and store, no model pin) spelled as the template it
+      binds. The star enrolled the template under its own name, so a crew named
+      otherwise, or with a folder, store or model of its own, is one the user
+      built and then promoted, and its template is its own (RFC §5).
+
+    Pure over plain values, so the in-memory half (the merged config) and the
+    on-disk half (the base document inside the lock) apply one rule.
+    """
+    if isinstance(stored_template, str) and stored_template:
+        return None
+    if not isinstance(default_alias, str) or not default_alias:
+        return None
+    row = rows.get(default_alias) if isinstance(rows, dict) else None
+    if not isinstance(row, dict):
+        return None
+    kiro = row.get("kiro_agent")
+    if not isinstance(kiro, str) or not kiro or kiro == DEFAULT_KIRO_TEMPLATE:
+        return None
+    if default_alias == "default":
+        return kiro
+    if kiro != default_alias:
+        return None
+    if (row.get("workspace") or "default") != "default":
+        return None
+    if (row.get("memory_store") or "default") != "default":
+        return None
+    if row.get("model"):
+        return None
+    return kiro
+
+
 def apply_document_migrations(
     data: dict,
     pending: frozenset[str],
@@ -146,6 +209,7 @@ def apply_document_migrations(
     adopt_keys: frozenset[str] = frozenset(),
     recorded_adoptions: list[str] | None = None,
     record_adoptions: Callable[[dict[str, object]], object],
+    dispatch: Callable[[str], str] = lambda name: name,
 ) -> bool:
     """Apply the pending write-back migrations to a raw config document in place.
 
@@ -239,6 +303,28 @@ def apply_document_migrations(
             else:
                 data["default_agent"] = "default"
             changed = data["default_agent"] != stored_default or changed
+
+    # Carry a pre-rule star pick into ``agent.default_agent``. Re-detected on
+    # *data*: a document another writer already seeded, or whose star row was
+    # edited since this load's read, answers None here and is left alone. The
+    # stored value is the row's ``kiro_agent`` resolved to the name kiro-cli
+    # declares (*dispatch*), the same mapping the crewmate path applies at
+    # dispatch time, since the template path reads this field verbatim.
+    if MIGRATE_STAR_DEFAULT_TEMPLATE in pending:
+        stored_section = data.get("agent")
+        stored_template = (
+            stored_section.get("default_agent") if isinstance(stored_section, dict) else None
+        )
+        carried = star_default_template_due(
+            stored_template, data.get("default_agent"), data.get("agents")
+        )
+        if carried is not None:
+            section = data.get("agent")
+            if not isinstance(section, dict):
+                section = {}
+                data["agent"] = section
+            section["default_agent"] = dispatch(carried)
+            changed = True
 
     # Un-materialize the auto-adopting superseded defaults this load found. Four
     # properties are load-bearing and all four live here rather than at the call
