@@ -160,6 +160,21 @@ class InProcessEmbedder:
             self._last_check = time.time()
         return self._available
 
+    def prefetch(self) -> None:
+        """Let the shared model start loading before this search's embed. Never blocks.
+
+        Only a hint to the backend (see ``EmbeddingBackend.prefetch``): no result
+        changes, and any error is swallowed because the embed that follows makes
+        the same attempt and reports it the usual way.
+        """
+        try:
+            backend = self._get_embedder()
+            prefetch = getattr(backend, "prefetch", None)
+            if callable(prefetch):
+                prefetch()
+        except Exception:  # noqa: BLE001
+            logger.debug("embedding prefetch failed", exc_info=True)
+
     def embed(self, text: str, *, priority: int = PRIORITY_NORMAL) -> list[float] | None:
         """Embed a single text. Returns float list or None on failure.
 
