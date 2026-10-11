@@ -286,6 +286,22 @@ def _kick_knowledge_orphan_reclaim(state: DashboardState) -> None:
         store = state._knowledge_store
         if store is None:
             return
+        # Search-only indexes a populated library skipped at construction
+        # (O(data), so never before the listener binds). Runs first: it is a
+        # no-op after the first boot, and it does not need the drained window.
+        try:
+            store.ensure_search_indexes()
+        except Exception:  # noqa: BLE001 -- search still works without them
+            logger.warning("Knowledge search index build failed", exc_info=True)
+        # The one-time FTS re-index (format v1, CJK-segmented terms) is lazy:
+        # left alone, the first keyword search pays it, ~2.5 s of CPU on a 22k-item
+        # library and 4.8 s of wall time beside the rest of start-up. Do it here,
+        # post-bind and off the loop, so that search finds the index current.
+        # A no-op once done; a writer-lock miss leaves it to the next reader.
+        try:
+            store.ensure_fts_index_current()
+        except Exception:  # noqa: BLE001 -- the first search retries it
+            logger.warning("Knowledge FTS index migration failed", exc_info=True)
         with store.maintenance_window() as quiescent:
             if quiescent:
                 store.reclaim_orphans()

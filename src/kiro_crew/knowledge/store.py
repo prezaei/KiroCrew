@@ -1036,9 +1036,7 @@ class KnowledgeStore:
             );
 
             CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
-            -- find_entity's case-insensitive fallback; without it every
-            -- query term that misses the exact name scans the whole table.
-            CREATE INDEX IF NOT EXISTS idx_entities_name_lower ON entities(LOWER(name));
+
             CREATE TABLE IF NOT EXISTS entity_relations (
                 id TEXT PRIMARY KEY,
                 source_id TEXT NOT NULL REFERENCES entities(id),
@@ -1060,9 +1058,6 @@ class KnowledgeStore:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (item_id, entity_id)
             );
-            -- The graph leg counts mentions by entity_id; the primary key leads
-            -- with item_id, so without this every search scans every mention.
-            CREATE INDEX IF NOT EXISTS idx_mentions_entity_item ON mentions(entity_id, item_id);
 
             CREATE TABLE IF NOT EXISTS source_locations (
                 id TEXT PRIMARY KEY,
@@ -1192,6 +1187,30 @@ class KnowledgeStore:
             );
 
         """)
+        self.db.commit()
+        # An empty library gets its search indexes now, for free. A populated
+        # one does not: building them is O(data) (seconds on a cold 59k-entity
+        # library) and this runs before the gateway listener binds. The gateway
+        # builds them post-bind via ensure_search_indexes(); until then a search
+        # returns the same rows, only slower.
+        if self.db.execute("SELECT 1 FROM mentions LIMIT 1").fetchone() is None:
+            self.ensure_search_indexes()
+
+    #: Indexes that only make knowledge search faster. Results never depend on
+    #: them, so a store may serve queries before they exist.
+    _SEARCH_INDEXES = (
+        # find_entity's case-insensitive fallback; without it every query term
+        # that misses the exact name scans the whole table.
+        "CREATE INDEX IF NOT EXISTS idx_entities_name_lower ON entities(LOWER(name))",
+        # The graph leg counts mentions by entity_id; the primary key leads with
+        # item_id, so without this every search scans every mention.
+        "CREATE INDEX IF NOT EXISTS idx_mentions_entity_item ON mentions(entity_id, item_id)",
+    )
+
+    def ensure_search_indexes(self) -> None:
+        """Create the search-only indexes if missing. O(data) the first time, then a no-op."""
+        for stmt in self._SEARCH_INDEXES:
+            self.db.execute(stmt)
         self.db.commit()
 
     def _migrate(self):
