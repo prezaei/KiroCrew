@@ -1677,6 +1677,7 @@ async def api_dashboard_fields(request: web.Request) -> web.Response:
             rollback_versions=retained,
             values=values,
             written_at=written_at,
+            slug=slug,
         )
     )
 
@@ -2253,6 +2254,13 @@ async def api_dashboard_preview(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "preview": staged})
 
 
+def _dashboard_block(slug: str) -> str:
+    """The new page's ``[DASHBOARD]`` block, upkeep pointer included."""
+    from kiro_crew import dashboard_agentic
+
+    return dashboard_agentic.turn_block(slug)
+
+
 async def api_dashboard_apply(request: web.Request) -> web.Response:
     """POST /api/agent-panel/dashboard/apply -- keep the staged page.
 
@@ -2286,6 +2294,10 @@ async def api_dashboard_apply(request: web.Request) -> web.Response:
             "ok": True,
             "instance_version": record.instance_version,
             "template_id": record.template_id,
+            # The member section is built at session start and after a compaction,
+            # not every turn, so the new page's block and upkeep pointer ride this
+            # reply until then.
+            "dashboard": await asyncio.to_thread(_dashboard_block, slug),
         }
     )
 
@@ -2330,6 +2342,7 @@ async def api_dashboard_rollback(request: web.Request) -> web.Response:
             "instance_version": record.instance_version,
             "restored_from": to_version,
             "template_id": record.template_id,
+            "dashboard": await asyncio.to_thread(_dashboard_block, slug),
         }
     )
 
