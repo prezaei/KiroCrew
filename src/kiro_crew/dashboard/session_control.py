@@ -48,10 +48,11 @@ import json
 import logging
 import unicodedata
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from kiro_crew import model_registry
 from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
@@ -111,6 +112,7 @@ from kiro_crew.dashboard.state import (
     SlotOrigin,
     _normalize_slot_key,
     _safe_folder_tree,
+    _SLOT_KEY_MAX_CHARS,
     load_window_off_loop,
 )
 from kiro_crew.dashboard.stop_retry import allow_escalation
@@ -440,6 +442,16 @@ def _caller_is_ownership_fenced(state: "DashboardState", caller_key: str) -> boo
     return bool(getattr(slot, "_created_by", ""))
 
 
+#: How far either lineage walk climbs before the chain is treated as corrupt, for the
+#: creation chain (:func:`_delegation_lineage_fenced`) and the manager line
+#: (:func:`_read_manager_line`) alike. A real chain is at most as deep as the live
+#: slots above a session, so it is short; the bound is here so a cycle written by a
+#: corrupted record cannot spin, and a chain this long fails closed as a gap. ONE
+#: spelling, because the two walks bound the same thing for the same reason and a
+#: second number would drift from this one the first time either moved.
+LINEAGE_WALK_MAX_DEPTH = 64
+
+
 def _delegation_lineage_fenced(state: "DashboardState", caller_key: str) -> bool:
     """Whether *caller_key* may NOT dispatch a private-member worker.
 
@@ -467,7 +479,7 @@ def _delegation_lineage_fenced(state: "DashboardState", caller_key: str) -> bool
     # The chain is at most as deep as live slots, but a bound keeps a corrupted
     # ``_created_by`` cycle from spinning; any chain this long is treated as a
     # gap and fails closed.
-    for _ in range(64):
+    for _ in range(LINEAGE_WALK_MAX_DEPTH):
         if key in seen:
             return True
         seen.add(key)
@@ -868,6 +880,1036 @@ def _managed_by_other(state: "DashboardState", slot: Any, caller_key: str) -> bo
     return require_manager_of(state, slot) != caller_key
 
 
+def _read_manager_line(
+    state: "DashboardState",
+    start_key: str,
+    wanted_key: str,
+    *,
+    seed: Sequence[str] = (),
+    unread_is_present: bool = False,
+) -> bool:
+    """Whether *wanted_key* is *start_key* or any session above it on the manager line.
+
+    The line is the ``_manager`` chain read LIVE at each hop, in the shape
+    :func:`_delegation_lineage_fenced` reads the creation chain in: one hop per live
+    slot, a visited set, and the same depth bound.
+
+    ``unread_is_present`` is what an unreadable line counts as, and it exists because a
+    reader and a WRITER need opposite answers from one walk. The fence asks "may this
+    caller act", and a line it could not finish must answer no, so it leaves this False
+    and an unread line denies reach. The loop guard asks "is it safe to write this
+    edge", and a line it could not finish must answer no to THAT, which is the same
+    walk reporting the opposite value -- so it passes True and an unread line refuses
+    the write. One flag rather than two functions, because the walk is one walk and the
+    only thing that differs is which way its ignorance points.
+
+    Which edges count as read to the end is a judgement worth stating. An empty hop
+    ends the line: a slot carrying neither field has no manager above it. A hop whose
+    slot is GONE also counts as read, even though an ancestor could sit above it,
+    because such a line is ALREADY unreadable to every walk and a write below the gap
+    cannot turn a working line into a broken one -- and that shape is ordinary, not
+    exotic: a person's own tab is unattributed, so closing it leaves the session below
+    pointing at a key that is gone, and counting that as unread would refuse every
+    handoff in their whole tree. The residual, stated rather than hidden: a target
+    sitting ABOVE such a gap had a working line of its own, and a handoff putting it
+    under a session below the gap costs it that line. It takes reach away rather than
+    granting any, the unfenced owner still reaches every session involved, and the
+    giver can hand it straight back.
+
+    Two edges leave the line UNREAD, and both describe a line that works today. A hop
+    already visited, which is a cycle in a record that should not have one. And a line
+    longer than :data:`LINEAGE_WALK_MAX_DEPTH`, where every hop so far was live and
+    readable and the walk simply ran out of budget, so an ancestor above the bound is
+    entirely ordinary.
+
+    *seed* pre-fills the visited set, so a caller already standing on a key has a line
+    that walks back onto it read as the cycle it is.
+
+    Dict and attribute reads only, with no I/O and no suspension, because the fence
+    that calls it runs inside ``close_target``'s no-suspension window.
+    A thin reading of :func:`_walk_manager_line`, which is the one traversal and the one
+    place each hop's state is judged. Nothing else walks the line: a second traversal is
+    how a guard ends up correct in one copy and absent from the other.
+    """
+    result = _walk_manager_line(state, start_key, wanted_key, seed=seed)
+    if result.found:
+        return True
+    return unread_is_present if result.unread else False
+
+
+class _LineRead(NamedTuple):
+    """What one walk of the manager line found, and if it stopped, whether that clears.
+
+    *found* is whether the wanted key is on the line. *unread* is whether the walk could
+    not be finished, which the two callers read with opposite polarity. *waits* is
+    whether the reason it could not be finished RESOLVES ITSELF -- a hop whose manager
+    has been decided and not yet published -- as against a cycle, a line past the depth
+    bound, or a record the bound evicted, none of which a retry would answer differently.
+
+    Three fields rather than a bool plus a second traversal, because the thing that
+    went wrong four times in this feature is a check that is correct where it runs and
+    is not on the path that reaches the decision. One walk cannot disagree with itself.
+    """
+
+    found: bool
+    unread: bool
+    #: WHY the walk could not be finished, for the refusal to name. ``""`` when it
+    #: finished. ``"pending"`` a hop whose manager is decided and not yet published;
+    #: ``"reused"`` a hop whose key is held by a session its edges are not about;
+    #: ``"inadmissible"`` a hop whose recorded manager may not be published at all;
+    #: ``"forgotten"`` a hop whose record the cap dropped; ``"cycle"`` and ``"depth"``
+    #: the two shapes that were always unread. Separate from :attr:`waits` because they
+    #: answer different questions: whether to retry, and what to tell someone reading
+    #: the refusal.
+    cause: str = ""
+
+    @property
+    def waits(self) -> bool:
+        """Whether the reason this line could not be read RESOLVES ITSELF.
+
+        Only a hop mid-publication does. A key held by another session, a grant that is
+        not admissible, a dropped record, a cycle and a line past the depth bound all
+        answer the same way however long anyone waits.
+        """
+        return self.cause == "pending"
+
+
+def _walk_manager_line(
+    state: "DashboardState",
+    start_key: str,
+    wanted_key: str,
+    *,
+    seed: Sequence[str] = (),
+    expected: "str | None" = None,
+) -> _LineRead:
+    """Walk the manager line above *start_key* once, judging every hop in one place.
+
+    The ONE traversal. :func:`_read_manager_line` reads its answer as a bool for the
+    fence and the loop guard, and the guard reads ``waits`` from the same result to
+    choose which refusal to raise -- so the unsettled check below happens exactly once,
+    on the only path either of them can reach a decision through.
+
+    Dict and attribute reads only, with no I/O and no suspension, because the fence that
+    calls it runs inside ``close_target``'s no-suspension window.
+
+    ORDERING INVARIANT, and it is the whole lesson of this function's history. Ten
+    findings on this walk had one shape: a guard that was correct where it ran, on a
+    path that reached a decision without running it. Each time the guard was added to
+    one more branch; each time a branch nobody had enumerated got there first. So the
+    rule is positional, and it is stated here because the only way to hold it is to
+    enumerate the branches rather than wait for the eleventh finding:
+
+        A check about a hop's IDENTITY runs before every branch that USES that identity.
+        A check about a hop's MANAGER runs before every branch that READS that manager.
+
+    Both halves matter and they are not the same rule. ``_key_is_ambiguous`` asks whether
+    the session holding this key is the one the edge that NAMED it was written for -- an
+    identity comparison against what that edge recorded, so a session that closed and
+    reopened its own tab passes it -- so it must precede the identity match
+    and the visited test -- the match IS an identity claim, which is how it came to be
+    the tenth finding. ``_hop_handoff_unsettled`` and the ``_manager_unresolved`` read ask
+    whether the hop's manager is published, so they must precede every read of that
+    manager, and they may sit AFTER the identity match: matching a key does not read its
+    manager, so refusing there would deny a caller whose own identity was never in doubt.
+    That asymmetry is deliberate and ``test_a_hop_mid_handoff_is_still_matched_on`` pins
+    it.
+
+    The branches, in order, so the next change has a list to check itself against: the
+    empty hop; the identity check; the identity match; the visited test; the manager
+    check; the live-versus-departed split; and within the departed side the occupancy
+    lookup, the eviction test, the tombstone, the pending entry and the entry naming
+    nobody. The empty hop is the one early return ahead of the identity check, and it is
+    ahead of it because there is no hop to ask about -- both checks take a key.
+    """
+    if not wanted_key:
+        # Not a key any session can hold, so it is on no line at all, read to the end.
+        return _LineRead(False, False)
+    seen = {key for key in seed if key}
+    key = start_key
+    for _ in range(LINEAGE_WALK_MAX_DEPTH):
+        if not key:
+            # No hop at all, so there is nothing for the per-hop checks to be about:
+            # both of them take a key, and the identity check answers False for "".
+            return _LineRead(False, False)
+        if _key_is_ambiguous(state, key, expected):
+            # BEFORE the match below, and before anything branches on whether this
+            # hop's slot is live, because a key held by a different session is ambiguous
+            # in every one of those positions. The match is the position that matters
+            # most: the key the caller is being recognised BY is itself a reusable name,
+            # so a new occupant of a deleted lead's key would otherwise be accepted as
+            # that lead and inherit every session below it -- the walk would hand over
+            # the whole line on the strength of a string.
+            #
+            # Only a key whose occupant is NOT the session its edges name is refused, so
+            # this costs nothing to a key that never changed hands and nothing to a
+            # session that closed and resumed under its own id. Deliberately narrower
+            # than moving the whole hop-state block above the match: a hop mid-handoff is
+            # still matched on, because its identity is not in doubt -- only its manager
+            # is, and that question belongs below where it is asked.
+            return _LineRead(False, True, "reused")
+        if key == wanted_key:
+            return _LineRead(True, False)
+        if key in seen:
+            # A cycle in a record that should not have one. Unread, and waiting does not
+            # make it readable.
+            return _LineRead(False, True, "cycle")
+        seen.add(key)
+        if _hop_handoff_unsettled(key):
+            # Asked of EVERY hop, before anything branches on whether its slot is still
+            # in the table, because the question has nothing to do with that. This hop's
+            # own next manager is already claimed and not yet published: the queued entry
+            # names the manager it is moving to, and what the walk can read -- the live
+            # ``_manager``, or a committed departure record -- names the one it is moving
+            # from. A departed hop is if anything the worse of the two, since its record
+            # looks settled and is read with no sign that a different manager is on its
+            # way.
+            #
+            # Reading either is how a cycle gets written. The endpoint fences refuse a
+            # move whose OWN target or recipient has an unsettled append, but they say
+            # nothing about the hops BETWEEN them, and the loop a handoff closes can run
+            # entirely through those: with L managing A and D, A managing C and D
+            # managing B, a timed-out A -> B leaves A reading as L's whether A is live or
+            # closed, so D -> C passes every endpoint check and the two deferred commits
+            # land A -> B -> D -> C -> A, cutting L off with no recovery path. So the hop
+            # counts as unread and both polarities refuse -- and it CLEARS, because that
+            # append settles either way, which is what ``waits`` carries to the caller.
+            return _LineRead(False, True, "pending")
+        above = state.get_slot(key)
+        if above is None:
+            # A DEPARTED hop, resolved here rather than by anybody having rewritten a
+            # field when it left: the departure recorded its own manager, and the walk
+            # reads through it. A hop it cannot resolve STOPS the walk -- it is not
+            # skipped, and nothing above it is admitted -- so an unresolvable line
+            # denies reach, which is what the gateway answers without this feature.
+            #
+            # WHICH occupant's record is read is decided by the key's occupancy and by
+            # nothing else, and the match on it is EXACT. A slot key is reusable, so
+            # "what did this key report to" is a question the key cannot answer: it has
+            # had several occupants. Resolving the occupancy first and then requiring
+            # the pair to match means an entry filed under any other generation is not
+            # something the walk can reach for -- not as a fallback, not when the exact
+            # one is missing, not ever. That is the property, and it does not depend on
+            # every writer having been fenced correctly.
+            held = _key_occupancy.get(key)
+            if held is None:
+                # Nothing on record about this key at all -- a key from before a
+                # restart, or one the bound has evicted. Read to the END, which is what
+                # a gap meant before any record existed: the line is ALREADY unreadable
+                # to every walk, a reader is denied reach by it, and a person's own
+                # closed tab is exactly this shape, so counting it as unread would
+                # refuse every handoff below it. No entry is reachable here to leak.
+                #
+                # One of those two causes is worth saying out loud. A key the CAP
+                # dropped is a line that worked a moment ago and stopped working for a
+                # reason that has nothing to do with the caller, and the refusal it
+                # produces is the same one an ordinary ownership failure produces. So
+                # the eviction is named here, once per walk that meets one.
+                if key in _recently_evicted_keys:
+                    logger.info(
+                        "manager line: %s is on a line through %s, whose departure "
+                        "record the %d-key cap dropped, so reach across it is refused "
+                        "-- this is a retention limit and not an ownership decision",
+                        wanted_key,
+                        key,
+                        _KEY_OCCUPANCY_MAX,
+                    )
+                if key in _recently_evicted_keys or _key_occupancy_evictions[0]:
+                    # UNREAD, not read-to-the-end, and the two polarities part here.
+                    # This key HAD a line a moment ago; the cap dropped it. A reader is
+                    # denied either way, but a WRITER must not conclude "nothing sits
+                    # above this hop" from a record that was discarded -- that is how
+                    # the loop guard writes an edge which becomes a cycle when the
+                    # evicted session reopens under its old creator.
+                    #
+                    # The CONDITION is the counter, not the shadow table. That table is
+                    # itself evictable, so a key can age out of it too -- and if this
+                    # answer depended on finding the key there, the boundary would move
+                    # when the shadow forgot, which is a boundary resting on an
+                    # evictable cache. The counter is never evicted: once this process
+                    # has dropped anything, it cannot prove THIS key is not one of the
+                    # ones it dropped, so it refuses. The shadow only decides whether
+                    # the log line above can name the key.
+                    #
+                    # Before the first eviction the counter is zero and a gap keeps the
+                    # answer below -- which is the case that must not refuse: a key
+                    # never seen in this process, such as a tab closed before a
+                    # restart, where refusing would freeze every handoff under it.
+                    return _LineRead(False, True, "forgotten")
+                return _LineRead(False, False)
+            departure = _departed_managers.get((key, held))
+            # NO second identity test here, and that absence is deliberate. This branch
+            # used to re-ask whether the key had changed hands, reading the same entry
+            # the per-hop check at the top of the loop reads -- two copies of one
+            # question, which is the shape every finding on this walk has had. The check
+            # above answers it for a departed hop and a live one alike, so a hop that
+            # reaches this line has already been judged on identity and the only
+            # questions left are about the line itself.
+            if departure is None or departure.pending:
+                # A hop whose line is NOT YET KNOWN, which is a different thing from a
+                # hop with no line. The occupant holding this key is inside its own
+                # close -- popped, not yet archived -- so what it reports to has not
+                # been published; or its entry was evicted, which leaves the same
+                # ignorance. Either way the walk could not read this line, so it
+                # answers ``unread_is_present`` and BOTH polarities refuse: a reader is
+                # denied reach, and a writer refuses to add an edge below a hop whose
+                # own manager is about to arrive.
+                #
+                # That second half is the whole point of separating this from the case
+                # below. Read as a line that ENDED, a pending vacancy tells the handoff
+                # loop guard that nothing sits above this hop, so the guard permits an
+                # edge that closes a cycle once the close commits and the real manager
+                # lands -- T -> R -> M -> T, with every manager above M cut off and the
+                # cycle persisted to the manager log. The vacancy is not an absence of
+                # a manager; it is a manager not yet said out loud.
+                #
+                # ``waits`` is True for a PENDING entry, whose close publishes or rolls
+                # back, and False for a MISSING one, which the bound dropped and no
+                # amount of waiting brings back.
+                return _LineRead(
+                    False, True, "pending" if departure is not None else "forgotten"
+                )
+            if not departure.manager:
+                # Departed, COMMITTED, and reporting to nobody. This one really is a
+                # line read to its end: there is no hop above it, now or later, so
+                # nothing above is admitted and a handoff below it is safe to write.
+                return _LineRead(False, False)
+            # The next hop's expected identity comes from THIS departure's own edge,
+            # exactly as a live hop's comes from its slot. A closed hop does not stop
+            # the line being judged on identity; it only moves where the answer is read.
+            expected = departure.manager_tab
+            key = departure.manager
+            continue
+        if getattr(above, "_manager_unresolved", False) is True:
+            # A LIVE hop whose manager has not been read from the crew log yet. Reading
+            # it now would fall through ``manager_of`` to ``_created_by`` -- the CREATOR,
+            # which is an answer only once that read has happened. Before it, a giver
+            # whose reach a recorded handoff already moved away would be admitted over
+            # the sessions below this hop, which is the one direction that must not be
+            # guessed.
+            #
+            # The departed branch above refuses the same slot by never recording a
+            # departure for it. This is that rule on the live path, which is the path
+            # the fence actually reaches when the hop is still open -- and it has to be
+            # here rather than at the verb, because the per-slot refusal fires on the
+            # TARGET and says nothing about a hop the walk passes through.
+            #
+            # It CLEARS: the read either lands or the slot is refused for good, so the
+            # caller is told to retry.
+            return _LineRead(False, True, "pending")
+        if getattr(above, "_manager_grant_inadmissible", False) is True:
+            # A LIVE hop whose manager WAS read and may not be published: that session
+            # is closed, or rebound to another principal's memory store. ``manager_of``
+            # still answers with the field, so following it here would hand the sessions
+            # under this hop to a manager the base PR's own admission refuses -- and
+            # refuses at the verb, on this slot, which says nothing about this slot being
+            # a hop somebody else's walk passes through. That is the whole shape of this
+            # finding: a boundary enforced where the slot is the subject and absent where
+            # it is a step.
+            #
+            # Refused rather than resolved to the creator. "The recorded manager is not
+            # admissible" is not "no handoff happened", and falling back would hand the
+            # line back to the session that gave it away.
+            #
+            # ``is True`` for the reason the check above uses it: a slot-like double
+            # answers every attribute with a truthy object, and reading that as
+            # inadmissible would refuse every line through every such object.
+            return _LineRead(False, True, "inadmissible")
+        record = _manager_record_refusal(state, above)
+        if record is not None:
+            # THE BASE PR'S OWN READER, asked of the edge this walk is about to follow.
+            # It re-asks the two things that were true when the record was published and
+            # can stop being true while it stands: the session answering to the
+            # manager's key is the one the record names, and the two still agree on
+            # their memory store. The verbs ask it about the slot they were called on;
+            # nothing asked it about a slot that is merely a STEP in somebody else's
+            # line, which is the hop this walk follows.
+            #
+            # Its code and not a second copy: a copy is a second thing to keep in step,
+            # and the only reason this hole existed is that one place asked and another
+            # did not. Its two refusals map onto the two this walk already has -- an
+            # unidentifiable occupant is the ambiguous one, a store that no longer
+            # agrees is the inadmissible one.
+            return _LineRead(
+                False,
+                True,
+                "reused" if record[1] == "manager_session_changed" else "inadmissible",
+            )
+        expected = _edge_identity(above)
+        key = manager_of(above)
+    # Out of depth, with every hop so far live and readable. Unread, and an ancestor
+    # above the bound is ordinary rather than something a retry resolves.
+    return _LineRead(False, True, "depth")
+
+
+def _edge_identity(slot: Any) -> "str | None":
+    """WHICH occupant of its manager's key *slot*'s edge was written for, or ``None``.
+
+    The identity an edge carries, read off the slot the edge belongs to. The base PR
+    records it when a handoff publishes: the ``_tab_id`` of the session that was handed
+    this one, which is persisted and so survives a restart.
+
+    ``None`` is a CREATION edge -- no handoff was published, so ``manager_of`` answers
+    ``_created_by`` and there is no recorded occupant to compare. That case is left
+    exactly as the gateway answers it without this feature: the base PR states it is the
+    same key-to-key question ``_created_by`` has always had, and widening it here would
+    refuse the ordinary creation chain. ``""`` is different and is NOT the same as
+    ``None``: the edge IS a handoff and names no occupant, which cannot be matched by
+    anybody and refuses.
+    """
+    handed = str(getattr(slot, "_manager", "") or "")
+    if not handed:
+        return None
+    return str(getattr(slot, "_manager_tab", "") or "")
+
+
+def _occupant_identity(state: "DashboardState", hop_key: str) -> str:
+    """WHO holds *hop_key* now, as a ``_tab_id``, or ``""`` when that cannot be said.
+
+    Live occupant first, through the base PR's own reader so the publish and every check
+    agree about where the value comes from. For a DEPARTED occupant the departure record
+    carries the tab it had while the slot was still in hand -- the walk's whole purpose
+    is to read through a hop whose session is gone, and a closed hop has no live slot to
+    read an identity off.
+
+    ``""`` for a key with no live occupant and no record, for an occupant that carried no
+    tab, and for a record the cap dropped. None of those says the occupant is the session
+    an edge meant, so none of them matches.
+    """
+    live = state.get_slot(hop_key)
+    if live is not None:
+        return _tab_identity(state, hop_key)
+    held = _key_occupancy.get(hop_key)
+    if held is None:
+        return ""
+    entry = _departed_managers.get((hop_key, held))
+    return entry.tab if entry is not None else ""
+
+
+def _key_is_ambiguous(
+    state: "DashboardState", hop_key: str, expected: "str | None"
+) -> bool:
+    """Whether the session holding *hop_key* is NOT the one the edge naming it was for.
+
+    *expected* is what that edge recorded, from :func:`_edge_identity`: ``None`` for a
+    creation edge, which carries no occupant and is not judged here, and otherwise the
+    ``_tab_id`` of the session the handoff was published to.
+
+    A slot key is a NAME, and a name can change hands while an edge keeps naming it. So
+    the comparison is on IDENTITY and not on how often the name was taken: a session
+    that closes and reopens its own tab keeps its ``_tab_id``, so every edge naming that
+    key still means it and the hop resolves. A key taken by a DIFFERENT session, and one
+    whose occupant cannot be identified, are both refused -- the second because an
+    ambiguous read must not resolve to a definitive answer.
+
+    The identity is the base PR's PERSISTED one rather than a second mechanism of this
+    PR's own. That matters beyond not duplicating: the question outlives the process,
+    and an answer that dies with it would resolve every edge confidently again after the
+    next restart.
+
+    Dict and attribute reads, with no I/O and no suspension, for the reason
+    :func:`manager_of` has none.
+    """
+    if not hop_key or expected is None:
+        return False
+    occupant = _occupant_identity(state, hop_key)
+    return not (expected and occupant and occupant == expected)
+
+
+def _hop_handoff_unsettled(hop_key: str) -> bool:
+    """Whether *hop_key* has a reparent append still in flight, so its manager is moving.
+
+    A handoff claims its edge before it publishes it: the entry is queued, the commit is
+    deferred until the writer's verdict, and ``_manager`` keeps naming the previous
+    manager across that whole window. So a walk that reads only the committed field
+    reads this hop as belonging to a manager it is in the act of leaving.
+
+    Read from :data:`_tree_pending_slots`, which is where both reparenting verbs
+    register the append and which clears itself when the append settles. A dict lookup
+    and a ``done()`` call, with no I/O and no suspension, for the reason
+    :func:`manager_of` has none: the fence that reaches this runs inside
+    ``close_target``'s no-suspension window.
+
+    Not the same question as the ENDPOINT fence :func:`_refuse_if_append_pending` asks.
+    That one refuses a move whose own target or recipient is mid-write, which is the
+    cheap early refusal and stays. This one is asked of every hop the line passes
+    THROUGH, because a loop can close entirely through hops that are neither endpoint.
+    """
+    if not hop_key:
+        return False
+    pending = _tree_pending_slots.get(hop_key)
+    return pending is not None and not pending.done()
+
+
+def _outside_manager_line(
+    state: "DashboardState", slot: Any, caller_key: str
+) -> "tuple[bool, str]":
+    """Whether *caller_key* is neither *slot*'s manager nor anyone above that manager.
+
+    The skip-level reading of the ownership fence, and a widening of nothing: a caller
+    on the line above a session's manager already controls that manager, so it can
+    already send it the words that drive the session. What the walk removes is the
+    detour -- a lead reaches the worker its conductor runs, instead of reaching the
+    worker only by telling the conductor to.
+
+    The DIRECT manager is answered first, by :func:`_managed_by_other`, which is an
+    attribute read and nothing else. So the one-level answer costs exactly what it cost
+    before the line existed, and the walk is reached only when that answer refuses.
+
+    Reached ONLY when ``agent.session_manager_chain`` is on. With the line off the fence
+    calls :func:`_managed_by_other` instead and never enters here, so there is no
+    "walk disabled" path through this function to get wrong and no second spelling of
+    the one-level answer. The switch is read by the fence, not here, because the fence
+    runs inside ``close_target``'s no-suspension window where a config load on the loop
+    is the one thing it must not do.
+
+    An unreadable line is left to deny reach, which is the fail-closed direction for a
+    READER: no ancestor is proven, so the caller is outside and the verb is refused. The
+    target's own key is seeded as visited, so a line that comes back to the target is
+    read as the cycle it is rather than walked a second time.
+
+    Answers ``(outside, cause)``. The cause is the walk's own reason for not finishing,
+    carried out so the REFUSAL can name it: a caller that was authorized a moment ago
+    and is now refused because a cap dropped a record has hit a retention limit, not an
+    ownership decision, and those must not read alike to whoever is debugging it. Empty
+    when the caller is simply not on the line, which is an ownership answer.
+    """
+    if not _managed_by_other(state, slot, caller_key):
+        return False, ""
+    line = _walk_manager_line(
+        state,
+        manager_of(slot),
+        caller_key,
+        seed=(str(getattr(slot, "key", "") or ""),),
+        # The FIRST hop is named by the target's own edge, so the identity that edge
+        # recorded has to come in with it. Without this the walk judges every hop above
+        # the first and takes the first on the strength of a key -- which is the one hop
+        # a handoff just moved, and the one most likely to name a session that has since
+        # been replaced.
+        expected=_edge_identity(slot),
+    )
+    return not line.found, line.cause
+
+
+class _Departure(NamedTuple):
+    """One occupant's departure: what it reported to, whether that is SETTLED, and
+    whether the key it is filed under has been REUSED.
+
+    *manager* is what the walk reads through -- the departed session's own manager, or
+    ``""`` for one that reported to nobody.
+
+    *pending* is the distinction the walk cannot do without. A close takes the slot out
+    of the live table and then keeps awaiting, so between those points the key has an
+    occupant whose manager is not published yet. That is not the same fact as "this
+    session reported to nobody", even though both leave no manager to read: one is a
+    line not yet knowable, the other is a line that has ended. Collapsing them lets the
+    handoff loop guard read a closing manager as the top of a line and write an edge
+    under it that becomes a CYCLE when the close commits.
+
+    *tab* and *manager_tab* are the TOMBSTONE, and they are the base PR's PERSISTED tab
+    identities rather than a flag because the question is about IDENTITY. A manager edge
+    names a slot KEY, and a key can be held by one session after another, so an edge
+    naming a key is ambiguous when the session holding that key now is a DIFFERENT
+    session from the one the edge was written for. Re-occupancy of the key is not that
+    fact -- it is a proxy for it, and the proxy is wrong in the direction a person meets
+    most often: a session that closes and reopens its own tab keeps its ``_tab_id``, and
+    refusing that refuses every handoff to a reopened tab.
+
+    So *tab* is this occupant's own identity, captured from the slot at its departure
+    while the slot is still in hand, and *manager_tab* is the identity ITS edge named,
+    so the hop above a closed hop is judged by the same rule a live edge is judged by.
+
+    The identity is ``_tab_id`` and not this module's own invention, for a reason beyond
+    not having two mechanisms for one fact: ``_tab_id`` is persisted, so the answer
+    outlives the process. A process-local identity would resolve every edge confidently
+    again after the next restart, which is the same ambiguity arriving one restart later.
+    which costs reach across that hop and grants nothing.
+    """
+
+    manager: str
+    pending: bool
+    #: WHICH occupant of :attr:`manager`'s key this departure's own edge named, from
+    #: :func:`_edge_identity`: ``None`` for a creation edge, which carries no occupant,
+    #: and otherwise that session's ``_tab_id``. Carried so the walk can judge the hop
+    #: ABOVE a closed one by the same rule it judges a live edge by.
+    manager_tab: "str | None" = None
+    #: This occupant's OWN ``_tab_id``, captured while the slot was still in hand, so an
+    #: edge naming this key can be told whether it meant this occupant. ``""`` when the
+    #: slot carried none, which matches nobody.
+    tab: str = ""
+
+
+_key_occupancy: "OrderedDict[str, int]" = OrderedDict()
+"""Which occupant holds each slot key NOW: slot key -> occupancy generation.
+
+    What makes a REUSABLE key safe to record departures against. A slot key can be held
+    by one session after another, so "what did this key report to" has as many answers
+    as the key has had occupants, and a lookup taking the key ALONE can hand back a
+    previous occupant's answer -- to a walk that would then give that occupant's manager
+    reach over the sessions the current one opened. So the occupancy is resolved from
+    here first, and the record is read under that occupant and no other.
+
+    Written where a key is TAKEN, by ``_ChatSlot.__init__`` through
+    :func:`note_key_taken`: that is the moment the answer changes, and it is the one
+    place every path that puts a session at a key already goes through -- a tab open, a
+    resume, a transfer import, a restore at startup. Deliberately NOT written by the
+    departure paths, which are several and each of which would have to remember.
+
+    This table carries the one size bound, and :data:`_departed_managers` lives inside
+    it: at most one generation per key is resolvable, so a key that is retaken or
+    evicted takes its entry with it. Process-local and never persisted, for the reason
+    the generation itself is not.
+    """
+
+
+#: The manager each DEPARTED session had, so the walk can resolve a hop whose slot is
+#: gone instead of a departure having to rewrite anybody's field.
+#:
+#: This is what replaces a repair writer. Writing the new manager onto each report at
+#: departure meant a loop over live slots, a staged field, a save per report and a
+#: publish -- and every one of those was a place for the departure and a concurrent
+#: handoff to disagree about one slot, or for a promoted manager to stop being valid
+#: between the stage and the publish. None of that exists here: a departure records ONE
+#: value about ITSELF, no report is touched, nothing is saved, and the resolution happens
+#: when the line is read.
+#:
+#: Held in memory rather than read back from the departed session's persisted metadata,
+#: which is the other way to resolve the hop. That read is disk I/O, and the walk is
+#: called from the ownership fence, which runs inside ``close_target``'s no-suspension
+#: window -- the window ``skip_enabled_check`` exists to keep one config read out of.
+#: A metadata read there would be a strictly worse instance of the blocking-call-on-the-
+#: loop class, so the value is captured while the slot is still in hand.
+#:
+#: KEYED ON THE PAIR (slot key, occupancy generation), never on the slot key alone, and
+#: read by EXACT match on that pair with no fallback of any kind. A record stored under
+#: a different generation for the same key can therefore never answer for the occupant
+#: holding it, which is the property a key-level lookup cannot have however the writers
+#: are fenced: a key-level entry that survives its occupant is an answer waiting to be
+#: given to the wrong question.
+#:
+#: An entry is written, naming nobody, for a departure that reported to nobody, and the
+#: walk reads that as the end of a line. An entry written at the POP is marked PENDING
+#: instead, and the walk reads that as a line it could not finish -- see
+#: :class:`_Departure`, where the difference between the two is the thing that keeps the
+#: handoff loop guard from writing a cycle under a closing manager.
+#:
+#: BOUNDED, and an evicted entry is not a silent skip: a hop with no exact record stops
+#: the walk and the fence refuses, which is the reach a gateway has without this feature
+#: at all -- so eviction costs reach and never a boundary. The bound is
+#: :data:`_key_occupancy`'s, because at most one generation per key is resolvable:
+#: retaking or evicting a key drops its entry with it, and there is no second eviction
+#: policy to disagree with the first.
+_departed_managers: "OrderedDict[tuple[str, int], _Departure]" = OrderedDict()
+
+#: How many KEYS are remembered, and so how many departures can be. A SIZE bound,
+#: deliberately its own number rather than :data:`LINEAGE_WALK_MAX_DEPTH`: that one
+#: limits how far ONE line is followed, while this limits how many independent lines can
+#: have a departed hop at once, and collapsing two different bounds onto one number is
+#: how a later change breaks one of them while satisfying the other.
+#:
+#: Bounded by COUNT rather than by liveness, and that is not laziness. "Drop an entry no
+#: live session's manager names" looks tighter and is wrong: in a line whose middle AND
+#: upper hops have both departed, no live session names the upper one -- only the
+#: departed middle one did -- so that rule deletes the hop the walk needs and the top
+#: manager loses reach to the bottom session. ``test_two_departed_hops_in_a_row_are_both
+#: _read_through`` is that case, and it fails under the liveness rule.
+#:
+#: How many keys the cap has dropped, in a one-element list so the counter can be read
+#: and bumped without a module-level ``global``. Counted because this bound is reached by
+#: ORDINARY use -- every slot construction takes a key -- and because what it costs is
+#: silent: the walk refuses a line through a dropped key and the fence answers the same
+#: ``not_creator`` an ownership failure answers, so without a count a lead that has lost
+#: reach over a closed conductor's workers is indistinguishable from one that never had
+#: it. A bound that is reached has to be observable, not merely safe.
+_key_occupancy_evictions: "list[int]" = [0]
+
+#: The keys the cap has dropped most recently, so a refusal can NAME this hop's record
+#: as evicted rather than never written. Bounded by the same number as the table it
+#: shadows, and it holds keys only -- which are already length-bounded by
+#: ``_normalize_slot_key`` -- so it retains nothing the occupancy table did not.
+#:
+#: COSMETIC ONLY, and it has to stay that way. This table is itself evictable, so a key
+#: can age out of it as well as out of the occupancy table; if the walk's answer for a
+#: gap depended on finding the key HERE, that answer would change when this table
+#: forgot, which is a boundary resting on an evictable cache. So the walk asks
+#: :data:`_key_occupancy_evictions` -- a counter nothing evicts -- whether this process
+#: has forgotten anything at all, and uses this table only to say WHICH key when it
+#: still knows.
+_recently_evicted_keys: "OrderedDict[str, None]" = OrderedDict()
+
+#: What eviction costs, which is REACH and not a boundary -- it is worth saying plainly
+#: because an earlier version of this comment documented the opposite as an accepted
+#: residual, and a reader could re-derive the hole from it. Evicting a key removes the
+#: occupancy the walk resolves against, so every departed hop under that key stops the
+#: walk and the fence refuses. Nothing is admitted by an eviction.
+#:
+#: The shape that comment used to admit was a late close for an older occupant writing
+#: its stale manager back once the current occupant's entry had been evicted, and the
+#: walk then handing that manager the replacement's sessions. Two things now refuse it
+#: independently: the read matches the pair EXACTLY, so an older occupant's entry is not
+#: a thing the walk can reach for; and the write refuses outright when the writer's
+#: generation is not the key's occupancy at write time, so the stale entry is never
+#: created. Raising this number would only narrow the window it used to need -- it is
+#: not what closed it, and it is not what keeps it closed.
+_KEY_OCCUPANCY_MAX = 512
+
+
+def _occupancy_generation_of(slot: Any) -> int:
+    """Which occupant of its key *slot* is, or ``0`` for an object that cannot say.
+
+    ``0`` is below every real generation (the counter starts at 1), so an object with
+    no such field is never PROVEN to be an obsolete occupant and its departure records
+    normally -- which is the direction that keeps a test double, or any future slot-like
+    object, behaving as it did before the fence existed. Every ``_ChatSlot`` carries the
+    field unconditionally from its constructor, so the fence is never inert for a real
+    slot.
+
+    An attribute read and nothing else, for the reason :func:`manager_of` is.
+    """
+    generation = getattr(slot, "_occupancy_generation", 0)
+    return generation if isinstance(generation, int) else 0
+
+
+def note_key_taken(taken_key: str, generation: int) -> None:
+    """Record that *generation* is the occupant holding *taken_key* from now on.
+
+    Called from ``_ChatSlot.__init__``, where a key is TAKEN. Recording the occupancy at
+    the take rather than on the departure paths is what makes a reusable key safe
+    structurally: a departure path that forgets something can only fail to record ITS
+    OWN entry, which costs reach, while a key whose occupancy went unrecorded would let
+    the walk read a previous occupant's entry, which grants it.
+
+    Drops the entry of the occupant being replaced, so a record never outlives the
+    occupancy it describes, and evicts oldest-first to hold the one size bound. Neither
+    is what makes the read safe -- the exact pair match is -- but together they keep the
+    table free of entries nothing can reach.
+
+    Occupancy only ever moves FORWARD. The counter is monotonic and a key's occupants
+    are constructed in order, so an equal or lower number is either the same object
+    announcing twice or an ordering that cannot happen; keeping the later occupant is
+    the direction that never lets an earlier one take a key back.
+    """
+    if not taken_key:
+        return
+    held = _key_occupancy.get(taken_key)
+    if held is not None:
+        if held >= generation:
+            return
+        # The earlier occupant's entry goes, which is what keeps a new occupant from
+        # inheriting an old manager. Nothing about the key's HISTORY has to be kept with
+        # it: an edge naming this key carries the identity it was written for, on the
+        # slot the edge belongs to, so a new occupant is told apart from the session the
+        # edge meant by comparing the two -- not by remembering how often the name
+        # changed hands. That is what makes the capped table safe here: dropping an
+        # entry can cost reach across a closed hop and cannot turn into a grant.
+        _departed_managers.pop((taken_key, held), None)
+    _key_occupancy[taken_key] = generation
+    _key_occupancy.move_to_end(taken_key)
+    while len(_key_occupancy) > _KEY_OCCUPANCY_MAX:
+        evicted_key, evicted_generation = _key_occupancy.popitem(last=False)
+        _departed_managers.pop((evicted_key, evicted_generation), None)
+        # COUNTED AND NAMED, because this bound is reached by ordinary use: every slot
+        # construction takes a key, so a long-running gateway passes the cap without
+        # anything unusual happening. What an eviction costs is reach across that key's
+        # departed hop, and the refusal it produces is the same ``not_creator`` an
+        # ordinary ownership failure produces -- so with nothing recorded here, a lead
+        # that has quietly lost reach over a closed conductor's workers looks exactly
+        # like a caller that never had it. The count is what tells those apart.
+        _key_occupancy_evictions[0] += 1
+        _recently_evicted_keys[evicted_key] = None
+        _recently_evicted_keys.move_to_end(evicted_key)
+        while len(_recently_evicted_keys) > _KEY_OCCUPANCY_MAX:
+            # The shadow is bounded too, so it can forget WHICH keys were dropped. That
+            # costs a REFUSAL ITS WORDING and nothing else: an edge carries the identity
+            # it was written for, so a key with no record of any kind is refused by the
+            # gap it leaves, not resolved through whoever holds it now. The identity
+            # question never rests on this table.
+            _recently_evicted_keys.popitem(last=False)
+        logger.info(
+            "manager line: the departure record for %s was dropped by the %d-key cap "
+            "(%d evicted so far); a line through it now refuses, so reach across that "
+            "closed session is gone until it is reopened",
+            evicted_key,
+            _KEY_OCCUPANCY_MAX,
+            _key_occupancy_evictions[0],
+        )
+
+
+def claim_occupancy_for_rebuilt_key(rebuilt_key: str) -> int:
+    """Give *rebuilt_key* an occupancy generation, for a key with no slot to carry one.
+
+    The boot rebuild files departures for keys whose session has CLOSED, so there is no
+    ``_ChatSlot`` to read a generation off. The record is keyed on the pair, so the key
+    still needs one, and it comes from the same monotonic counter every live slot draws
+    from -- so a rebuilt key and a slot minted afterwards can never collide, and a later
+    occupant of the key is still a LATER generation than the rebuilt one.
+    """
+    from kiro_crew.dashboard.state import _SLOT_OCCUPANCY_GENERATIONS
+
+    generation = next(_SLOT_OCCUPANCY_GENERATIONS)
+    note_key_taken(rebuilt_key, generation)
+    return generation
+
+
+#: "Keep whatever the prior entry said", for the two identity fields of
+#: :class:`_Departure`. A distinct object rather than ``None``, because ``None`` is a
+#: MEANINGFUL value of ``manager_tab`` -- it is "a creation edge" -- and a
+#: sentinel that collides with a real value is how a sticky field quietly un-sticks.
+_KEEP: Any = object()
+
+
+def _record_departure(
+    key: str,
+    generation: int,
+    manager: str,
+    *,
+    pending: bool,
+    manager_tab: "str | None | Any" = _KEEP,
+    tab: "str | Any" = _KEEP,
+) -> bool:
+    """Write the entry for *generation* of *key*, if that occupant still holds the key.
+
+    *pending* says whether what this occupant reports to is settled. The pop writes a
+    PENDING entry and the committed side overwrites it with a settled one, so the walk
+    can tell a manager not yet published from a session that reported to nobody.
+
+    The one writer of :data:`_departed_managers`, and the write-side half of the fence:
+    an occupant whose generation is no longer the key's occupancy AT WRITE TIME records
+    nothing at all, so a close finishing late for a session the key has moved on from
+    does not leave a stale entry behind to be found. The read does not depend on this --
+    it matches the pair exactly and would not reach such an entry either way -- which is
+    the point of having both. Returns whether it wrote.
+    """
+    if _key_occupancy.get(key) != generation:
+        return False
+    if len(manager) > _SLOT_KEY_MAX_CHARS:
+        # A COUNT bound does not bound the memory a table holds: 512 entries each
+        # carrying an arbitrarily long string is 512 arbitrarily long strings, and this
+        # value arrives from restored history metadata, where ``created_by`` is read
+        # back with no length check of its own. The slot-key bound is the right one to
+        # apply, because that is what this field is -- a slot key naming a manager.
+        #
+        # Rejected rather than truncated, and nothing is written at all. Truncating an
+        # authorization key would invent a DIFFERENT key, which either names nobody or,
+        # worse, names some other session; and a value no real slot key can equal is not
+        # a manager the walk should resolve to. With no entry the hop is unresolved, so
+        # both polarities refuse -- the loss is reach across one departed hop, never a
+        # boundary, which is the direction everything else here fails in.
+        logger.warning(
+            "manager line: a departure for %s names a manager of %d characters, past "
+            "the slot-key bound, so the hop is left unresolved",
+            key,
+            len(manager),
+        )
+        return False
+    # The tombstone is STICKY. Who this occupant took the key from is a fact about the
+    # take, so this occupant recording its own manager must not clear it -- the edge
+    # that names this key may well have been written for the occupant before it, and
+    # nothing in the edge says otherwise.
+    prior = _departed_managers.get((key, generation))
+    if manager_tab is _KEEP:
+        manager_tab = prior.manager_tab if prior is not None else None
+    if tab is _KEEP:
+        tab = prior.tab if prior is not None else ""
+    _departed_managers[(key, generation)] = _Departure(manager, pending, manager_tab, tab)
+    _departed_managers.move_to_end((key, generation))
+    return True
+
+
+def note_key_vacated(vacated_key: str, vacated_slot: Any) -> None:
+    """Invalidate *vacated_key*'s departure edge the moment the key leaves the table.
+
+    Called at the POP, by each path that has awaits between taking the slot out and
+    committing the departure. Between those two points the key is absent from the live
+    table, so the walk stops reading :func:`manager_of` off a live slot and starts
+    reading the record -- and the record still describes whichever occupant held the
+    key BEFORE this one, because the manager of this one is published only once its
+    close commits. A key that has been reused therefore hands its previous occupant's
+    manager reach over the sessions the CURRENT occupant opened, for as long as the
+    close takes.
+
+    So the edge is cleared here, under the CURRENT occupancy: the entry names nobody,
+    and the walk refuses at that hop exactly as it refuses a hop with no exact entry.
+    What the window costs is reach, for the length of one close, and it costs it to the
+    session that is closing anyway. The previous occupant's entry is not involved --
+    it went when this occupant took the key, and the exact match would not reach it in
+    any case.
+
+    Nothing is published about this slot's own manager. That stays with
+    :func:`note_manager_departed` on the committed side, so a close that fails and puts
+    the tab back has still handed nothing up -- the entry it leaves resolves to nobody,
+    and the slot is live again and answered from the table.
+    """
+    if not vacated_key:
+        return
+    # PENDING, not "nobody". The difference is what stops the handoff loop guard from
+    # treating this closing manager as the top of a line and writing an edge under it
+    # that closes a cycle once the close commits. See :class:`_Departure`.
+    #
+    # The occupant's own SESSION ID is captured here, at the pop, because this is the
+    # last point the slot is in hand -- and it is what the next occupant of this key is
+    # compared against. A resume finds its own id here and resolves; a different
+    # session finds another and is refused.
+    _record_departure(
+        vacated_key,
+        _occupancy_generation_of(vacated_slot),
+        "",
+        pending=True,
+        tab=str(getattr(vacated_slot, "_tab_id", "") or ""),
+    )
+
+
+def _forget_unsettlable_entry(key: str, slot: Any) -> None:
+    """Drop the PENDING entry the pop wrote, for a close that will never settle it.
+
+    A pop writes a pending entry so the window between it and the commit refuses on an
+    entry of its own rather than on the absence of one, and the commit overwrites it.
+    Two of those commits record nothing at all -- a manager that was never read, and a
+    grant that is not admissible -- and the pending entry they leave behind is then
+    permanent: the walk reads it as a line about to be published, every handoff under
+    it is refused as ``manager_line_pending``, and the message tells the caller to retry
+    something that cannot land. The hop must still refuse. It must stop CLAIMING it is
+    about to clear.
+
+    So the entry goes, which leaves the gap a key with no record leaves, and the walk
+    refuses that without promising anything -- the same answer an evicted record gets,
+    for the same reason: nothing here is known.
+    """
+    generation = _occupancy_generation_of(slot)
+    if _key_occupancy.get(key) != generation:
+        # Not this occupant's key any more, so the entry under that pair is not this
+        # close's to remove -- the same fence every writer here applies.
+        return
+    _departed_managers.pop((key, generation), None)
+
+
+def note_manager_departed(state: "DashboardState", departed_key: str, departed_slot: Any) -> str:
+    """Record what *departed_slot* reported to, so the walk can read through it later.
+
+    Called by each path that takes a live slot OUT of the table -- a tab close, the
+    idle-archive sweep, a history delete -- on that path's committed side, with the slot
+    still in hand. It is the whole of what a departure does to the reporting line.
+
+    Synchronous, one mapping write, no save and no loop over other slots. That is the
+    point: there is no second writer to exclude, no report whose manager could change
+    between a check and a stage, and no promoted manager whose identity could go stale
+    across a save, because none of those steps happen.
+
+    Records the departed session's OWN manager, read with :func:`manager_of` while the
+    slot object is still available. A session that reported to nobody records NOBODY --
+    there is no hop above it to resolve to, and the walk stopping there is correct.
+
+    RECORDED AGAINST ITS OWN OCCUPANCY, because a close is not instantaneous and a slot
+    key is reusable. The paths that call this take the slot out of the live table FIRST
+    and then keep awaiting -- a task cancel with its own timeout, then a save -- so the
+    key is free for a whole window before the departure is recorded. A replacement
+    minted in that window can open sessions of its own and depart in turn, and the
+    original close then arrives LAST with a manager that has nothing to do with the
+    key's current line. Recorded under the KEY, that close's manager becomes the answer
+    for the replacement's sessions -- reach over sessions it never managed, with nothing
+    to take it back.
+
+    Recorded under the PAIR, it is not an answer to any question the walk asks, because
+    the walk resolves the occupancy first and matches the pair exactly. And this writer
+    refuses outright when its generation is not the key's occupancy at write time, so
+    the entry is not created either. Those are two independent refusals on purpose: the
+    exact match is what holds even if a writer is ever added that forgets to check, and
+    the write check is what keeps the table free of entries nothing can reach -- neither
+    is load-bearing alone, and the ordering the closes arrive in stops mattering.
+
+    So an entry carries the generation of the occupant it is about (see
+    :func:`_record_departure`). The entry for a departure with nobody above it is KEPT,
+    naming nobody, rather than dropped, because an ABSENT entry means something else:
+    an occupant still inside its own close, which the walk refuses rather than reading
+    to the end.
+
+    The OTHER half of that window is :func:`note_key_vacated`, called at the pop, which
+    publishes nobody under the current occupancy so the window refuses on its own entry
+    rather than on the absence of one.
+
+    Returns the value recorded, or ``""`` when nothing was -- including when the key's
+    occupancy has moved on from this slot.
+    """
+    if not departed_key:
+        return ""
+    # ``is True`` and not truthiness, for the reason :func:`_occupancy_generation_of`
+    # checks ``isinstance``: a slot-like double answers every attribute with a truthy
+    # object, and reading that as "unresolved" would silently stop recording departures
+    # for every such object. A real slot sets this to a bool.
+    if getattr(departed_slot, "_manager_grant_inadmissible", False) is True:
+        # Its manager was READ and may not be published -- closed, or under another
+        # principal's store. The live walk refuses such a hop; recording its manager
+        # here would publish the same refused grant as a SETTLED edge that outlives the
+        # slot carrying the refusal, so the walk would follow after the close what it
+        # declined to follow before it. Nothing is recorded and the hop stays
+        # unresolved, which costs reach across one departed session.
+        logger.info(
+            "manager line: %s departed with a manager that is not admissible, so no "
+            "departure is recorded and a line through it refuses",
+            departed_key,
+        )
+        _forget_unsettlable_entry(departed_key, departed_slot)
+        return ""
+    if getattr(departed_slot, "_manager_unresolved", False) is True:
+        # The base PR's default-deny, carried into the record rather than only into the
+        # verbs. ``_manager_unresolved`` says no decided manager has been read from the
+        # log for this slot yet, so ``manager_of`` would fall back to the CREATOR -- and
+        # an empty ``_manager`` means "the creator holds it" only once that read has
+        # happened. Recording the creator here would turn "not known yet" into a
+        # decided answer that outlives the refusal session control makes for the verbs,
+        # and the walk would then resolve through a manager nothing established.
+        #
+        # So nothing is recorded and the hop stays unresolved, which costs reach across
+        # a session that departed before its manager was read and grants nobody
+        # anything.
+        logger.info(
+            "manager line: %s departed before its manager was read from the crew log, "
+            "so no departure is recorded and a line through it refuses",
+            departed_key,
+        )
+        _forget_unsettlable_entry(departed_key, departed_slot)
+        return ""
+    generation = _occupancy_generation_of(departed_slot)
+    if generation == 0 and departed_key not in _key_occupancy:
+        # An object that cannot say which occupant it is -- a test double, or any
+        # future slot-like object. Nothing can prove it obsolete and no other entry can
+        # be filed under its key, so it anchors its own occupancy and records, which
+        # keeps such an object behaving as it did before the pair key existed. Guarded
+        # on the key being UNKNOWN: a key that has a real occupancy must not be taken
+        # over by an object that cannot name one.
+        note_key_taken(departed_key, generation)
+    # The COMMITTED manager, through :func:`manager_of`, which reads ``_manager`` and
+    # then ``_created_by`` and no third field -- the slot carries no pending-manager
+    # field at all, and that is what makes this structural rather than careful. Were
+    # one reintroduced and read here, the record could name a manager the disk does
+    # not agree with, and the walk would admit reach on the strength of a write that
+    # may yet be withdrawn. A session whose handoff was in flight when it departed is
+    # recorded under the manager it actually had.
+    above = manager_of(departed_slot)
+    if above == departed_key:
+        # Names ITSELF, so there is no hop above it to resolve to. Recorded the same
+        # way a departure with an empty manager is: as nobody.
+        above = ""
+    # Written under THIS occupant's pair, or not at all. An earlier session that held
+    # the same key is neither consulted nor overwritten: its entry went when this
+    # occupant took the key, and had it survived it would still not be a pair the walk
+    # looks up. A departure with nobody above it says exactly that, as an entry, since
+    # an absent entry means an occupant still inside its close.
+    #
+    # Its own session id goes in with it, for the same reason the pop records one: the
+    # next occupant of this key is told apart from this one by comparing the two, and a
+    # close that commits without the slot in hand could not read it afterwards.
+    if not _record_departure(
+        departed_key,
+        generation,
+        above,
+        pending=False,
+        tab=str(getattr(departed_slot, "_tab_id", "") or ""),
+        manager_tab=_edge_identity(departed_slot),
+    ):
+        return ""
+    return above
+
+
 #: The operations a handoff widens, and the whole of what it widens. A session handed
 #: to a new manager can be driven and put down by that manager -- which is the point,
 #: since a conductor that cannot send to a worker cannot run it -- and nothing else
@@ -1054,6 +2096,30 @@ def session_control_enabled() -> bool:
     except Exception:
         logger.warning(
             "session_control: config read failed — refusing until config loads", exc_info=True
+        )
+        return False
+
+
+def manager_chain_enabled() -> bool:
+    """Whether reach follows the whole manager line, and a departure hands sessions up.
+
+    OFF by default, and off is not a degraded mode: with it off the fence answers the
+    DIRECT manager and nothing else, and a departing session hands nothing up, which is
+    exactly what the gateway answers without this feature at all. So the shipped default
+    changes no behaviour, and an operator opts in to the line.
+
+    A config read that RAISES resolves to disabled, for the reason
+    :func:`session_control_enabled`'s does: unrelated corruption in another section must
+    not quietly widen who can drive a session. Here that direction is also the field's
+    own default, so the two agree and there is nothing for a malformed value to ride
+    back to.
+    """
+    try:
+        return bool(KiroCrewConfig.load().agent.session_manager_chain)
+    except Exception:
+        logger.warning(
+            "session_manager_chain: config read failed -- keeping the line off",
+            exc_info=True,
         )
         return False
 
@@ -2342,7 +3408,13 @@ def newly_held_constraints(
 SENDER_LOST_REACH = "sender_no_longer_manages"
 
 
-def sender_lost_its_reach(state: "DashboardState", slot: "_ChatSlot", entry_meta: Any) -> bool:
+def sender_lost_its_reach(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    entry_meta: Any,
+    *,
+    chain_enabled: bool | None = None,
+) -> bool:
     """Whether a queued delivery's SENDER is still allowed to drive *slot*.
 
     The caller-side half of the admission, re-asserted at the drain. The target-side
@@ -2353,11 +3425,17 @@ def sender_lost_its_reach(state: "DashboardState", slot: "_ChatSlot", entry_meta
     message on a busy worker, hands the worker to a conductor, and the message runs
     afterwards under an authorization the handoff revoked.
 
-    Read through :func:`_managed_by_other`, which is the SAME predicate
-    ``authorize_target`` admitted the entry with -- not a second manager read placed
-    here. It goes through :func:`require_manager_of`, so an unread manager raises
-    rather than answering, and the caller treats that as a drop for the reason the
-    snapshot's ``manager_unknown`` names.
+    Read through the SAME predicate ``authorize_target`` admitted the entry with -- not
+    a second manager read placed here, and not a narrower one. With the line off that is
+    :func:`_managed_by_other`; with it on it is the line, because that is what admitted
+    the entry. Either goes through :func:`require_manager_of`, so an unread manager
+    raises rather than answering, and the caller treats that as a drop for the reason
+    the snapshot's ``manager_unknown`` names.
+
+    *chain_enabled* lets a caller that already resolved the switch pass it rather than
+    have this read config again, which is the same reason ``authorize_target`` takes a
+    precomputed value: the read is cheap and cached, but a drain is not the place to
+    discover a config file has moved.
 
     Only a CROSS-SESSION delivery is re-checked, and the entry's own provenance is what
     says it is one. A human-typed entry carries no :data:`ADMISSION_PROVENANCE_META_KEY`,
@@ -2381,7 +3459,17 @@ def sender_lost_its_reach(state: "DashboardState", slot: "_ChatSlot", entry_meta
     sender = send_origin_sender(entry_meta)
     if not sender:
         return False
-    return _managed_by_other(state, slot, sender)
+    chain = manager_chain_enabled() if chain_enabled is None else chain_enabled
+    if not chain:
+        return _managed_by_other(state, slot, sender)
+    # THE SAME POLICY THE ADMISSION USED, which with the line on is the whole line and
+    # not the direct manager. Left on the one-level predicate, this re-check is STRICTER
+    # than the admission it re-asserts: a lead that reached its grandchild worker through
+    # its conductor is admitted by the fence, queues a prompt on a busy worker, and the
+    # drain then reads "not its manager" and deletes the message -- a send accepted and
+    # silently dropped with the reporting line never having changed. A re-check may
+    # refuse what the admission refused; it may never refuse what the admission allowed.
+    return _outside_manager_line(state, slot, sender)[0]
 
 
 def describe_containment_change(constraints: list[str], *, mirror_unverified: bool = False) -> str:
@@ -4853,6 +5941,7 @@ def authorize_target(
     operation: str,
     skip_enabled_check: bool = False,
     precomputed_ownership_fenced: bool | None = None,
+    precomputed_manager_chain: bool | None = None,
     allow_self: bool = False,
 ) -> "_ChatSlot":
     """Resolve *target* and decide whether *caller* may act on it.
@@ -4965,19 +6054,55 @@ def authorize_target(
     # waiver an agent-created session could never release itself from a parent,
     # because its own ``_created_by`` names its creator and not itself.
     self_addressed = slot.key == caller_key
-    # The fence reads the slot's CURRENT holder for the verbs a handoff widens, and
-    # its creator for every other verb. Both readings come from :func:`manager_of`,
-    # which answers ``_created_by`` until something writes ``_manager`` -- so on a
-    # gateway where nothing has been handed over the two readings are the same value
-    # and this line decides exactly what ``_created_by_other`` decided before it.
+    # The fence reads the slot's MANAGER LINE for the verbs a handoff widens, and its
+    # creator for every other verb. The line starts at :func:`manager_of`, which
+    # answers ``_created_by`` until something writes ``_manager``, and then climbs.
+    #
+    # So this WIDENS what the fence admits, and it does so whether or not anything was
+    # ever handed over. A handoff is not a precondition: on a gateway where nothing has
+    # been handed over, the line IS the creation chain, and a caller that created the
+    # session that created the target now reaches the target. Only a one-level chain
+    # decides what ``_created_by_other`` decided before the field existed -- its walk
+    # has nowhere to go -- and a lead that opens a conductor which opens workers is
+    # exactly the two-level case this admits.
+    #
+    # That is the intent and not a side effect. A caller on the line above already
+    # drives the middle session, so it can already have the target driven by telling
+    # the middle one to; the walk removes the relay, not a boundary. And it is what
+    # keeps the line usable when the middle session closes, which is the ordinary end
+    # of that session's job rather than an exceptional state.
     #
     # Split by OPERATION rather than by caller, because what a handoff moves is the
     # right to run a session, not the right to mint one against the giver's memory
     # binding. ``create`` and ``fork`` are not in the widened set and the memory
     # delegation gate reads ``_created_by`` alone, so a manager that was given a
     # worker cannot turn it into a deputy with the giver's store.
+    #: The line walk's reason for not finishing, if it ran, so the refusal can name
+    #: which refusal it is. A dropped record and a caller who was never on the line are
+    #: different situations and must not read alike.
+    line_cause: "list[str]" = []
+
+    def _manager_fence(s: Any, k: str) -> bool:
+        """The widened fence: the one-level predicate, or the whole line when it is on.
+
+        Wraps the base PR's own ``_managed_by_other`` rather than replacing it. With
+        the chain OFF this IS that predicate and nothing else runs, so off is the base
+        PR's behaviour and not a mode of this one. With it on, the walk decides and its
+        reason is kept for the refusal below.
+        """
+        chain_enabled = (
+            manager_chain_enabled()
+            if precomputed_manager_chain is None
+            else precomputed_manager_chain
+        )
+        if not chain_enabled:
+            return _managed_by_other(state, s, k)
+        outside, cause = _outside_manager_line(state, s, k)
+        line_cause[:] = [cause]
+        return outside
+
     fence_other = (
-        (lambda s, k: _managed_by_other(state, s, k))
+        _manager_fence
         if operation in HANDOFF_WIDENED_OPERATIONS
         else _created_by_other
     )
@@ -5016,6 +6141,61 @@ def authorize_target(
         # rather than a class it cannot see; the cron prefix is still readable
         # without config, and the inline path keeps the three-way wording since
         # it is already reading config anyway.
+        # A RETENTION refusal reads differently from an ownership one, because they are
+        # different situations: "you were never on this line" and "this line was
+        # readable until a cap dropped a record" need different answers from whoever is
+        # debugging a denial. The cap is reached by ordinary use -- every slot
+        # construction takes a key -- so without this a previously authorized caller
+        # starts getting a permission error with nothing anywhere naming the cause.
+        #
+        # A reused key is a THIRD situation and keeps its own wording too: forgotten
+        # means the record is gone, reused means the record cannot say which occupant
+        # an edge meant. Both refuse; neither explains the other.
+        cause = line_cause[0] if line_cause else ""
+        if cause == "forgotten":
+            # The CAUSE is named only when this process has actually dropped something.
+            # The same walk answer is given for a record that was never written and for
+            # one a close removed because it could never settle -- and telling those
+            # callers "the line passed through 512 other sessions" sends whoever is
+            # debugging the denial to look for churn that did not happen. What is true
+            # in every case is that the record is not available; the retention limit is
+            # an additional fact, and it is stated when it is one.
+            raise deny(
+                (
+                    f"{target!r} is reachable only through a session whose manager "
+                    f"record this gateway has dropped: the line passed through more "
+                    f"than {_KEY_OCCUPANCY_MAX} other sessions since it closed, so the "
+                    "reach is gone. This is a retention limit rather than a decision "
+                    "about you"
+                )
+                if _key_occupancy_evictions[0]
+                else (
+                    f"{target!r} is reachable only through a session whose manager this "
+                    "gateway has no usable record of, so the line cannot be read to the "
+                    "end. This is not a decision about you, and it does not clear by "
+                    "retrying"
+                ),
+                "manager_line_forgotten",
+            )
+        if cause == "reused":
+            raise deny(
+                f"{target!r} is reachable only through a session key that has since "
+                "been taken by a different session, so which one the line meant cannot "
+                "be established and the reach is refused",
+                "manager_line_ambiguous",
+            )
+        if cause == "inadmissible":
+            # A FOURTH situation, and it is the only one of the four that is a decision
+            # about somebody: a hop on this line was handed to a manager that may not
+            # hold it -- closed, or running under another principal's store. Saying
+            # "dropped" or "ambiguous" here would send whoever is debugging it to look
+            # for a retention limit that is not there.
+            raise deny(
+                f"{target!r} is reachable only through a session whose own manager was "
+                "recorded and is not admissible, so the line stops there and the reach "
+                "is refused until that session is handed over again",
+                "manager_line_inadmissible",
+            )
         fence_reason = _not_creator_reason(
             state, caller_key, caller_slot, precomputed_ownership_fenced
         )
@@ -6239,7 +7419,324 @@ async def _restore_managers(
             state.push_slots_update()
         except Exception:
             logger.debug("manager rebuild: the sidebar push failed", exc_info=True)
+    # The line ABOVE a closed manager, brought back in the SAME pass and inside the same
+    # window, so there is no second rebuild and no second gate to keep in step.
+    await _rebuild_departures_from_log(state)
     return moved
+
+
+#: "This cannot be decided without reading the disk", from the synchronous half of the
+#: restored-edge admission. Distinct from ``None``, which is a verdict -- the edge is
+#: admissible -- so the two cannot be confused by a caller that only tests for falsey.
+_UNDECIDED: Any = object()
+
+
+def managed_store(persisted: "dict[str, Any]") -> str:
+    """The principal a closed session's persisted line records, or ``""``."""
+    return str(persisted.get("memory_store") or "")
+
+
+def _restored_edge_refusal_now(
+    state: "DashboardState", manager: str, store: str
+) -> "str | None | Any":
+    """The part of the restored-edge admission that needs no disk, or :data:`_UNDECIDED`.
+
+    Split out because it has to run TWICE and in two different positions: once while the
+    edge is being judged, and once more immediately before the edge is written, after
+    the last await. Everything it reads -- the live table, a live slot's own store -- can
+    change across a suspension, and this rebuild runs as a background task on a gateway
+    that is already serving. A judgement made before an await and acted on after it is
+    the whole shape of this feature's findings.
+
+    :data:`_UNDECIDED` means the manager is not in the live table, so its principal is
+    on disk and only the caller that may suspend can answer.
+    """
+    from kiro_crew.members import DM_SLOT_KEY_PREFIX
+
+    if manager.startswith(DM_SLOT_KEY_PREFIX):
+        return "a crew member's own session cannot manage another"
+    live = state.get_slot(manager)
+    if live is None:
+        return _UNDECIDED
+    refusal = _live_target_refusal(live)
+    if refusal is not None:
+        return refusal[0]
+    if str(getattr(live, "memory_store", "") or "") != store:
+        return "it is bound to a different memory store, so it runs under another principal"
+    return None
+
+
+async def _restored_edge_refusal(
+    state: "DashboardState", key: str, persisted: "dict[str, Any]", manager: str
+) -> str | None:
+    """Why a rebuilt edge from *key* to *manager* may not be published, or ``None``.
+
+    The admission the boot rebuild was missing, asked for an edge rather than for a
+    live slot. Two sessions joined by a handoff run under ONE principal -- that is the
+    positive test the verb applies before it appends -- and between the append and this
+    restart the recipient can have been rebound to another store. The log cannot know
+    that, so the log is the authority on WHAT was recorded and this answers whether the
+    record may still take effect.
+
+    The manager's own principal comes from its live slot when it has one and from its
+    persisted line when it does not, because a departure edge may legitimately name a
+    hop that is itself closed. A principal that cannot be read is a refusal: a fact this
+    gateway has lost is not a fact in the caller's favour.
+    """
+    sync_answer = _restored_edge_refusal_now(state, manager, managed_store(persisted))
+    if sync_answer != _UNDECIDED:
+        return sync_answer
+    if True:
+        try:
+            above_meta, above_readable = await asyncio.to_thread(
+                state.conversation_log.get_metadata_status, _history_key_for(manager)
+            )
+        except Exception:
+            logger.debug("departure rebuild: %s principal unreadable", manager, exc_info=True)
+            return "its memory binding could not be read"
+        if not above_readable:
+            return "its memory binding could not be read"
+        if str(above_meta.get("memory_store") or "") != managed_store(persisted):
+            return (
+                "it is bound to a different memory store, so it runs under another principal"
+            )
+    return None
+
+
+async def _rebuild_departures_from_log(state: "DashboardState") -> int:
+    """Bring back what each CLOSED manager reported to. Answers how many came back.
+
+    Without this the hand-up is process-local, and a restart undoes exactly the thing
+    the feature is for: a conductor closes, its workers name that closed conductor as
+    their manager, and falling back to the creation chain strands them -- which is the
+    bug this feature exists to fix. A feature that undoes its own purpose on the next
+    restart is not one anybody can turn on.
+
+    NO NEW DURABLE WRITE IS NEEDED, which is the whole reason this is small. A handoff
+    already publishes ``session/manager_set`` only once that entry is on disk, and the
+    entry outlives the session's close -- so what a departed session reported to is
+    already recorded, by the base PR, in the form
+    :func:`~kiro_crew.crew_log.session_tree.slot_manager` reads. The in-memory record
+    was never the storage; it was a cache of a read nobody was doing for closed keys.
+
+    WHICH keys to read is the only real question, because the log is not enumerable by
+    slot. It does not have to be: the walk only ever meets a departed hop that some LIVE
+    slot's manager edge names, so the keys worth reading are reachable from the live
+    table by following those edges upward. That is the same input
+    :func:`rebuild_managers_from_log` iterates, one step further.
+
+    Bounded three ways: the depth bound per chain, :data:`_KEY_OCCUPANCY_MAX` overall,
+    and one key read at a time hopped off the loop -- the restore driver's own shape, so
+    a gateway with many tabs does not hold the loop long enough to trip the stall
+    watchdog. An undecided read records NOTHING and leaves the hop unresolved, because a
+    read that may have missed an entry must not be written down as a fact.
+    """
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+        from kiro_crew.crew_log.session_tree import slot_manager, slot_manager_tab
+        from kiro_crew.crew_log.store import session_units_for_slot
+
+        if not crew_log_emit.enabled():
+            return 0
+    except Exception:
+        logger.debug("departure rebuild: the crew log is not available", exc_info=True)
+        return 0
+
+    pending = [manager_of(slot) for slot in list(getattr(state, "_slots", {}).values())]
+    seen: set[str] = set()
+    brought_back = 0
+    for _ in range(LINEAGE_WALK_MAX_DEPTH):
+        if not pending or len(seen) >= _KEY_OCCUPANCY_MAX:
+            break
+        climbing: list[str] = []
+        for key in pending:
+            if not key or key in seen or len(seen) >= _KEY_OCCUPANCY_MAX:
+                continue
+            seen.add(key)
+            if state.get_slot(key) is not None:
+                # Live: answered from the table, and its own manager edge is the next
+                # hop worth following.
+                climbing.append(manager_of(state.get_slot(key)))
+                continue
+            try:
+                manager, decided = await asyncio.to_thread(slot_manager, key)
+            except Exception:
+                logger.debug("departure rebuild: %s could not be read", key, exc_info=True)
+                continue
+            if not decided:
+                # Leave it unresolved. The walk refuses a hop it has no entry for, which
+                # is the reach a gateway has without this feature at all.
+                continue
+            # THE CLOSED SESSION'S OWN PERSISTED LINE, read in this same hop off the
+            # loop. Four things needed it and each of them was a separate finding: what
+            # a decided-empty answer MEANS, which principal the closed session ran
+            # under, whether the recorded grant is still admissible, and whether any of
+            # that could be read at all. One read answers all four, and a read that did
+            # not land answers none of them -- so nothing is recorded, which refuses.
+            try:
+                persisted, persisted_readable = await asyncio.to_thread(
+                    state.conversation_log.get_metadata_status, _history_key_for(key)
+                )
+            except Exception:
+                logger.debug("departure rebuild: %s metadata unreadable", key, exc_info=True)
+                persisted, persisted_readable = {}, False
+            if not persisted_readable:
+                # A FORGOTTEN FACT IS NOT A FACT IN YOUR FAVOUR. The line this key
+                # reported to cannot be established, so the hop stays unresolved and
+                # every walk through it refuses -- which is the reach a gateway has
+                # without this feature at all.
+                logger.info(
+                    "departure rebuild: %s has no readable metadata line, so its line "
+                    "is left unresolved and reach across it is refused",
+                    key,
+                )
+                continue
+            try:
+                units = await asyncio.to_thread(session_units_for_slot, key)
+                units_known = True
+            except Exception:
+                # A read that FAILED is not the fact that the key had one occupant.
+                # Treating it as one would file the entry without a tombstone, and the
+                # walk would then resolve an edge naming this key confidently -- which
+                # is the direction that grants reach rather than costing it. So an
+                # unreadable unit list counts as REUSED: the conservative answer is the
+                # one that refuses.
+                logger.debug("departure rebuild: %s units unreadable", key, exc_info=True)
+                units, units_known = (), False
+            # MORE THAN ONE unit for a key means the key has run under several session
+            # ids -- which is reuse, the same fact the in-process tombstone carries, and
+            # the reason it has to be derived here too: a restart must not forget that a
+            # key is ambiguous and start resolving its edges confidently again.
+            reused = (len(units) > 1) if units_known else True
+            # The OCCUPANCY the log recorded with that manager, read through the base
+            # PR's own companion reader so this pass and the live check cannot disagree
+            # about where the value comes from. Empty is unverifiable and refuses, which
+            # is what the live check does with it too.
+            try:
+                recorded_tab = await asyncio.to_thread(slot_manager_tab, key)
+            except Exception:
+                logger.debug("departure rebuild: %s manager tab unreadable", key, exc_info=True)
+                recorded_tab = ""
+            # WHETHER THE LOG NAMED A MANAGER AT ALL, read before the substitution
+            # below replaces an empty answer with the creator. The two cases carry
+            # different identities: a published handoff names an occupant, and a
+            # creation edge names none and is not judged on identity -- the base PR
+            # states that is the same key-to-key question ``_created_by`` has always
+            # had. Collapsed, a restored creation edge would read as a handoff whose
+            # occupancy is unknown and refuse the most ordinary line there is.
+            handed = bool(manager)
+            if not manager:
+                # DECIDED AND EMPTY is a statement, not a blank. ``slot_manager``
+                # answering ``("", True)`` means the log was read and records no
+                # handoff, which is "the session's CREATOR manages it" -- the same
+                # thing an empty ``_manager`` means on a live slot. Recorded as
+                # ``""`` it would mean something else entirely, "reports to nobody",
+                # and the walk would stop at this hop: the most ordinary shape there
+                # is -- a lead opens a conductor, the conductor opens a worker, nobody
+                # hands anything over, the conductor closes -- would lose the lead its
+                # reach at every restart, which is the behaviour this pass exists to
+                # restore.
+                #
+                # So the creator is read from the same persisted line, and a line that
+                # names no creator really is a session with nobody above it.
+                manager = str(persisted.get("created_by") or "")
+            if manager:
+                # THE ADMISSION, RE-ASKED, which is the one check this pass was
+                # publishing grants without. The verb applies it to a live recipient
+                # immediately before it appends, and the base PR re-applies it when it
+                # restores a LIVE slot's manager -- but a departure edge grants reach
+                # over everything below a closed hop just the same, and between the
+                # append and this restart the recipient can have been rebound to
+                # another principal's store, closed or scoped away.
+                #
+                # The PRINCIPAL half of that admission, and deliberately not the
+                # whole of it: ``_manager_still_admissible`` also requires the manager
+                # to be a live session, which is right for a field that has to name
+                # something drivable now and wrong for a step in a line, because the
+                # hop above a departed hop may be departed too -- the chained departure
+                # this feature exists to read through. Borrowing the rule whole would
+                # refuse exactly the case the pass is for, so what is reused is the
+                # test that decides a principal and the one that refuses a member's own
+                # surface, and the liveness condition is left where it belongs.
+                refusal = await _restored_edge_refusal(state, key, persisted, manager)
+                if refusal is not None:
+                    logger.info(
+                        "departure rebuild: the line above %s names %s, which is not "
+                        "admissible (%s), so nothing is recorded and reach across it "
+                        "is refused",
+                        key,
+                        manager,
+                        refusal,
+                    )
+                    continue
+            # EVERY VOLATILE CONDITION, RE-ASKED HERE, with no suspension between this
+            # block and the write below it. This is the position that matters and the
+            # earlier placement was the bug: each check was correct where it stood and
+            # stood before a ``to_thread`` read, while the rebuild runs as a background
+            # task on a gateway that is already serving. Between the read and the write
+            # a person can resume this very key, and the recipient this edge names can
+            # be reopened under a different principal.
+            #
+            # Taking a key an occupant already holds does not merely add a stale entry:
+            # it moves the key's occupancy off that occupant, which silently disables
+            # every departure the occupant later records (each checks its own generation
+            # against the key's) and replaces the mark its construction wrote with an
+            # entry naming whatever manager the LOG remembers -- an edge nothing can
+            # retract. And a recipient that came back on another store is exactly the
+            # grant the admission above refuses; answered before it was reopened, that
+            # refusal describes a session that no longer exists.
+            if state.get_slot(key) is not None or key in _key_occupancy:
+                logger.info(
+                    "departure rebuild: %s was taken while its line was being read, so "
+                    "the live occupant keeps the key and nothing is recorded for it",
+                    key,
+                )
+                continue
+            if manager:
+                settled = _restored_edge_refusal_now(state, manager, managed_store(persisted))
+                if settled is not _UNDECIDED and settled is not None:
+                    logger.info(
+                        "departure rebuild: the line above %s names %s, which stopped "
+                        "being admissible while its line was read (%s), so nothing is "
+                        "recorded and reach across it is refused",
+                        key,
+                        manager,
+                        settled,
+                    )
+                    continue
+            generation = claim_occupancy_for_rebuilt_key(key)
+            # A rebuilt key's occupant identity is NOT KNOWN: the log says the key ran,
+            # and for a key with several units it says more than one session ran under
+            # it, but nothing here says which one an edge naming the key was written
+            # The rebuilt entry carries the identity its own line records and nothing
+            # it cannot establish. The departed occupant's ``_tab_id`` is on the
+            # persisted line this pass already read, so the hop can be told apart from
+            # a later occupant of the same key; a line that names none leaves ``""``,
+            # which matches nobody and refuses.
+            #
+            # ``manager_tab`` is what the departed session recorded about ITS manager,
+            # also from that line, so the hop above this one is judged by the same rule
+            # a live edge is judged by. A key the log shows running under SEVERAL
+            # sessions is refused outright: the units say the name changed hands and
+            # the line cannot say which occupant an edge above meant.
+            if _record_departure(
+                key,
+                generation,
+                manager,
+                pending=False,
+                tab="" if reused else str(persisted.get("tab_id") or ""),
+                manager_tab=recorded_tab if handed else None,
+            ):
+                brought_back += 1
+            if manager:
+                climbing.append(manager)
+        pending = climbing
+    if brought_back:
+        logger.info(
+            "Restored the line above %d closed session(s) from the crew log",
+            brought_back,
+        )
+    return brought_back
 
 
 async def handoff_target(
@@ -6292,6 +7789,14 @@ async def handoff_target(
     recipient = (to or "").strip()
     if not recipient:
         raise SessionControlError("a recipient session is required", code="recipient_required")
+    # One read for the whole verb: the recipient is authorized twice and the loop guard
+    # runs twice, and a switch that answered differently between them would admit a
+    # recipient under one rule and write the field under another.
+    #
+    # OFF the loop. The read loads and validates the config file on a cache miss, and
+    # this verb reaches it BEFORE its own prewarm, so an inline read blocks every other
+    # session's turn whenever a config edit landed in the request.
+    chain_enabled = await asyncio.to_thread(manager_chain_enabled)
 
     def _receiver(*, skip_enabled_check: bool) -> "_ChatSlot":
         """The receiver, authorized on the SAME terms as the target, plus a principal test.
@@ -6325,6 +7830,10 @@ async def handoff_target(
             target=recipient,
             operation="handoff",
             precomputed_ownership_fenced=caller_fenced,
+            # Resolved once by this verb, so the in-lock re-run cannot answer a
+            # different question from the one that admitted the recipient, and so the
+            # synchronous re-run loads no config.
+            precomputed_manager_chain=chain_enabled,
             skip_enabled_check=skip_enabled_check,
         )
         if got.key.startswith(DM_SLOT_KEY_PREFIX):
@@ -6484,6 +7993,57 @@ async def handoff_target(
                 f"{name_for_person(state, receiver_key)!r} already manages "
                 f"{name_for_person(state, slot)!r}, so there is nothing to hand over",
                 code="already_manager",
+            )
+        # Refused on the MANAGER line specifically: the tree guard inside the mover
+        # answers for the sidebar, and an adoption moves a sidebar edge without moving
+        # a manager, so the two can disagree about who is above whom.
+        # Gated with the reach it protects. A loop matters because every walk over one
+        # fails closed, and with the line OFF nothing walks it -- the fence reads the
+        # direct manager alone -- so there is no broken state here to prevent, and
+        # refusing anyway would reject a handoff the gateway accepts today.
+        #
+        # ``unread_is_present=True`` is the writer's polarity: a line the walk could not
+        # finish leaves a loop possible, and a WRITER cannot act on the fence's
+        # assumption. The fence refuses reach on an unread line and is safe to be wrong;
+        # this write would PERSIST the loop, and one loop takes the manager away from
+        # every session in it at once.
+        # NO starting identity, and that is not an omission. The walk starts AT the
+        # receiver rather than above it: the edge that would name it is the one this
+        # verb is deciding whether to write, and the receiver itself was resolved live
+        # by the verb a moment ago. Every hop ABOVE it is named by an edge the walk
+        # reads as it goes, so each of those is judged.
+        line = _walk_manager_line(state, receiver_key, slot.key) if chain_enabled else None
+        if line is not None and (line.found or line.unread):
+            # REFUSED either way: walking a chain that could not be read to the end and
+            # concluding "no cycle" is the thing this fences. The walk reads EVERY hop's
+            # unsettled state, not just the two endpoints, because the loop a handoff
+            # closes can run entirely through hops that are neither.
+            #
+            # Both answers come from the SAME walk. Asking a second time to find out why
+            # it stopped is how a guard ends up correct in one copy and missing from the
+            # other, which is the shape of mistake this feature has already made.
+            #
+            # The two codes differ only in what the caller should do about it, and only
+            # the ways a line goes unread that CLEAR ON THEIR OWN earn a retry: a hop
+            # inside its own close, which publishes its manager when that close commits
+            # or rolls back, and a hop mid-handoff, which publishes when its append
+            # settles. A cycle further up, a line past the depth bound and an evicted
+            # record do not change by waiting, so they keep the refusal this verb
+            # already shipped.
+            if line.waits:
+                raise SessionControlError(
+                    f"the reporting line above {receiver_key!r} runs through a session "
+                    "whose own manager is still being written, so whether this would "
+                    "close a loop is not known yet -- retry once that write has landed "
+                    f"to hand {slot.key!r} over",
+                    status=409,
+                    code="manager_line_pending",
+                )
+            raise SessionControlError(
+                f"{receiver_key!r} reports to {slot.key!r}, or its reporting line cannot "
+                f"be read to the end, so handing {slot.key!r} to it would risk a loop",
+                status=409,
+                code="would_cycle",
             )
         again = _receiver(skip_enabled_check=True)
         if again.key != receiver_key or _target_replaced(state, receiver_key, receiver_at_resolve):
@@ -6693,6 +8253,30 @@ async def handoff_target(
         # Two writes, in this order and no other: the ENTRY (who holds it) and then the
         # MARKER (that the log has an answer). The manager itself is never written to
         # the slot's line -- the field is this process's copy of the entry.
+
+        # Except for one copy, and it has to be corrected HERE. This window outlives
+        # the request, so a close or an idle archive can take this slot out of the live
+        # table while the entry above is still being written. That departure records the
+        # COMMITTED manager, which at that moment is still the one being replaced -- so
+        # publishing the new manager onto a slot nobody can reach any more would leave
+        # the walk resolving this key through the manager the handoff just took it from,
+        # and refusing the one it was given to, until the entry is evicted.
+        #
+        # So if the slot has already left the table, the departure entry for THIS
+        # occupancy is rewritten with what was just published. Guarded by the same
+        # generation check every other writer goes through, so a key the occupancy has
+        # moved on from is not resurrected, and a slot still live records nothing here:
+        # the walk reads a live slot off the table and never consults the entry.
+        if state.get_slot(slot.key) is not slot:
+            # ``receiver_key`` rather than re-reading the slot: this commit published
+            # that value two lines up, so it is the one manager here that needs no
+            # chokepoint -- re-reading it would be asking a question already answered.
+            _record_departure(
+                slot.key,
+                _occupancy_generation_of(slot),
+                receiver_key,
+                pending=False,
+            )
 
     moved = await _reparent_target(
         state,
@@ -8840,6 +10424,14 @@ async def close_target(
     # gate below still raises ``caller_unidentified`` before the fence is consulted.
     if caller_fenced is None:
         caller_fenced = bool(caller_key) and _caller_is_ownership_fenced(state, caller_key)
+    # The manager-line switch, resolved HERE for the reason the fence verdict above is:
+    # the synchronous re-check runs inside ``close_slot``'s no-suspension window, and
+    # reading it there would load config on the loop. One read, both gates, so the
+    # re-check cannot answer a different question from the one that admitted the close.
+    #
+    # In a THREAD, like the prewarm above it, because the read validates the config file
+    # on a cache miss and doing that inline blocks the loop for every other session.
+    chain_enabled = await asyncio.to_thread(manager_chain_enabled)
 
     slot = authorize_target(
         state,
@@ -8847,6 +10439,7 @@ async def close_target(
         target=target,
         operation="close",
         precomputed_ownership_fenced=caller_fenced,
+        precomputed_manager_chain=chain_enabled,
         allow_self=True,
     )
     slot_key = slot.key
@@ -8883,6 +10476,7 @@ async def close_target(
                 operation="close",
                 skip_enabled_check=True,
                 precomputed_ownership_fenced=caller_fenced,
+                precomputed_manager_chain=chain_enabled,
                 allow_self=True,
             )
         except SessionControlError as exc:

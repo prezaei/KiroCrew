@@ -7013,7 +7013,20 @@ async def _start_next_queued_turn(
     # qualifying.
     # Everything below — the note flush peeking at queue[0], the user-intervention
     # purge, the dequeue itself — must see only entries that may still deliver.
-    if _drop_stale_admissions(state, slot):
+    # The manager-line switch is resolved OFF THE LOOP and handed to the sweep. The
+    # sweep is synchronous and its sender re-check needs the flag; read there, a config
+    # cache miss parses and validates the config file on the event loop, which stalls
+    # every task on the gateway. Resolved here, where this function may suspend, and
+    # only when there is a queue for the sweep to judge at all.
+    #
+    # Deferred import for the reason every other session-control use here defers it:
+    # that module imports this package's modules at module level.
+    from kiro_crew.dashboard.session_control import manager_chain_enabled
+
+    _chain_for_sweep = (
+        await asyncio.to_thread(manager_chain_enabled) if slot._queue else False
+    )
+    if _drop_stale_admissions(state, slot, chain_enabled=_chain_for_sweep):
         # The head entry is waiting on a manager read -- neither deliverable nor
         # droppable yet. Start nothing from it: delivering would grant a reach this
         # gateway cannot currently verify, and dropping would destroy a message
