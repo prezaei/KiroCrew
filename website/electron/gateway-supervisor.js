@@ -21,6 +21,8 @@ const {
   describeIncompleteBundle,
   nextInstallingDialogState,
   INSTALLING_DIALOG_TITLE,
+  PRUNED_BACKEND_MESSAGE,
+  PRUNED_DIALOG_TITLE,
   shouldReclassifyAsInstalling,
   currentAttemptLog,
   SPAWN_MARKER,
@@ -254,6 +256,12 @@ function createGatewaySupervisor({
   // whenever one reaches handoff, and whenever a monitored backend answers
   // again, so each incident gets its own budget.
   let reresolveAttempts = 0;
+  // Set when a packaged Windows app refuses the PATH fallback after a
+  // stale-bundle incident: the backend tree it ran from was removed, so the
+  // dialog says to quit and reopen rather than to wait for an install. Kept
+  // across a Retry (which resets reresolveAttempts) and cleared once a launcher
+  // resolves to a real backend again.
+  let backendPruned = false;
   // Executables the CURRENT child was actually spawned from. findKirocrewBin
   // re-probes on every call, so after a Toolbox `current` junction is repointed
   // at a newer version it names a backend this shell never started; the child
@@ -1403,16 +1411,21 @@ function createGatewaySupervisor({
     // is back at a probed path. Unpackaged (source checkout) launches keep the
     // PATH fallback, which is how a developer's own install is found.
     if (IS_WIN && app.isPackaged && isPathFallback(bin)) {
+      if (reresolveAttempts >= 1) backendPruned = true;
       userError(`spawn REFUSED: no bundled backend under ${processObj.resourcesPath || "(no resourcesPath)"} — a packaged app does not fall back to ${bin} on PATH`);
       gatewayStartFailure = {
-        error: describeIncompleteBundle([], { autoRetry: true }),
+        error: backendPruned
+          ? PRUNED_BACKEND_MESSAGE
+          : describeIncompleteBundle([], { autoRetry: true }),
         incompleteBundle: true,
         bundled: true,
+        backendPruned,
       };
       sendStatus(INSTALLING_STATUS);
       resolve(false);
       return;
     }
+    backendPruned = false;
 
     // The Windows installer writes backend-dist incrementally. Refusing an
     // incomplete interpreter is preventive but cannot see package siblings that
@@ -1787,6 +1800,9 @@ function createGatewaySupervisor({
       // gateway while it swaps the bundle, and a retry then would relaunch what
       // it is replacing.
       autoRetryProbe,
+      // The refusal followed a stale-bundle incident: an unresolvable launcher
+      // means the backend was removed, and the probe's copy says so.
+      backendPruned: prunedBackend = false,
     } = options;
     const showQuitButton = configuredShowQuitButton ?? !noRetry;
     // The installing dialog opens on what the bundle looks like NOW, not on the
@@ -1795,7 +1811,7 @@ function createGatewaySupervisor({
     // again after the probe had already shown it falling.
     const opening = typeof autoRetryProbe === "function"
       ? (() => {
-        try { return nextInstallingDialogState(autoRetryProbe()); }
+        try { return nextInstallingDialogState(autoRetryProbe(), { pruned: prunedBackend }); }
         catch { return null; }
       })()
       : null;
@@ -1971,6 +1987,7 @@ function createGatewaySupervisor({
       };
       if (typeof autoRetryProbe === "function") {
         let paintedMessage = message;
+        let paintedTitle = title;
         probeTimer = setIntervalFn(() => {
           if (errorWindow.isDestroyed() || quitting() || installingUpdate) {
             stopProbe();
@@ -1978,7 +1995,7 @@ function createGatewaySupervisor({
           }
           let state;
           try {
-            state = nextInstallingDialogState(autoRetryProbe());
+            state = nextInstallingDialogState(autoRetryProbe(), { pruned: prunedBackend });
           } catch (probeError) {
             glog(`install probe failed (${probeError && probeError.message}); will probe again`);
             return;
@@ -1996,6 +2013,14 @@ function createGatewaySupervisor({
             // process composed.
             errorWindow.webContents
               .executeJavaScript(`document.querySelector(".msg").innerHTML = ${JSON.stringify(renderParagraphs(state.message))}`)
+              .catch(() => { /* window closing under the paint */ });
+          }
+          // A pruned backend whose files start arriving again is an install in
+          // progress, so the title follows the message out of the pruned copy.
+          if (!state.complete && state.title !== paintedTitle) {
+            paintedTitle = state.title;
+            errorWindow.webContents
+              .executeJavaScript(`document.querySelector(".title").textContent = ${JSON.stringify(state.title)};`)
               .catch(() => { /* window closing under the paint */ });
           }
           if (state.complete) {
@@ -2494,7 +2519,7 @@ function createGatewaySupervisor({
       let title;
       let message;
       if (failureKind === "installing") {
-        title = INSTALLING_DIALOG_TITLE;
+        title = failureRecord?.backendPruned ? PRUNED_DIALOG_TITLE : INSTALLING_DIALOG_TITLE;
         message = refusedBeforeSpawn
           ? error.message
           : describeIncompleteBundle([]);
@@ -2545,6 +2570,9 @@ function createGatewaySupervisor({
           // not run, so both action buttons reach the same check and quitting and
           // reopening is the route that recovers.
           ...(gatewayStartFailure?.localStartUnverifiable ? { accentQuit: true } : {}),
+          // The pruned-backend paragraph asks for Quit first, so the accent
+          // follows it.
+          ...(failureRecord?.backendPruned ? { accentQuit: true, backendPruned: true } : {}),
           // Retry reaches the crew in every one of these states, so it says which
           // crew in every one of them. Labelling it only where the accent moves
           // made the same control read as two: "Retry" in one opening of a dialog

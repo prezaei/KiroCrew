@@ -739,6 +739,8 @@ function staleBundleHarness({
   // the default; the cases that matter override it with a foreign holder or a
   // probe that cannot run at all.
   ownerExecFile = ownerProbe(OWN_GATEWAY_COMMAND),
+  BrowserWindow,
+  mainWindow,
 } = {}) {
   const state = {
     pruned: false,
@@ -777,7 +779,8 @@ function staleBundleHarness({
     httpMod,
     timers,
     ...(ownerExecFile ? { execFileFn: ownerExecFile } : {}),
-    mainWindow: {
+    ...(BrowserWindow ? { BrowserWindow } : {}),
+    mainWindow: mainWindow || {
       isDestroyed: () => false,
       webContents: { send: (channel, message) => state.statuses.push(`${channel}:${message}`) },
     },
@@ -1823,6 +1826,94 @@ test("a packaged Windows app whose bundle was pruned refuses the PATH fallback i
   assert.ok(errors.some((line) => line.includes("spawn REFUSED: no bundled backend")));
   assert.ok(state.statuses.some((line) => line.includes("Finishing installation")));
   assert.deepStrictEqual(state.exits, []);
+});
+
+// Opens the failure dialog for a packaged Windows app. With `pruneMidRun` the
+// bundle is pruned under a running backend, so the PATH refusal follows a
+// stale-asset re-resolve; without it the app boots with no bundle at all.
+async function windowsNoBundleDialog({ pruneMidRun }) {
+  const { windows, FakeBrowserWindow } = fakeDialogWindows();
+  let built = null;
+  const window = {
+    // Destroyed once a retry has spawned: that ends the post-retry boot before
+    // it polls a backend this harness has not got.
+    isDestroyed: () => built.spawnCalls.length > (pruneMidRun ? 1 : 0),
+    show() {},
+    focus() {},
+    isMinimized: () => false,
+    restore() {},
+    webContents: { loadFile() {}, send() {} },
+  };
+  built = staleBundleHarness({
+    platform: "win32",
+    isPackaged: true,
+    BrowserWindow: FakeBrowserWindow,
+    mainWindow: window,
+  });
+  if (pruneMidRun) {
+    assert.strictEqual(await built.supervisor.start(), true);
+    built.state.pruned = true;
+    built.spawnCalls[0].child.emit("exit", 75, null);
+  } else {
+    built.state.pruned = true;
+    assert.strictEqual(await built.supervisor.start(), false);
+  }
+  assert.ok(built.errors.some((line) => line.includes("spawn REFUSED: no bundled backend")));
+  void built.supervisor.connect(window);
+  await flush();
+  assert.strictEqual(windows.length, 1, "the failure dialog opened");
+  return { ...built, windows };
+}
+
+const QUIT_ACCENTED = `<button class="ok" onclick="act('quit')">Quit</button>`;
+
+// Nothing is installing once the running version's tree was pruned, so the
+// dialog says the files were removed and puts quit-and-reopen first, with the
+// accent on Quit. The probe stays armed: a backend back at a probed path still
+// starts on its own.
+test("a pruned Windows backend opens the removed-files dialog and still auto-starts when files return", async () => {
+  const { windows, timers, state, spawnCalls } = await windowsNoBundleDialog({ pruneMidRun: true });
+  const dialog = windows[0];
+  const html = decodeURIComponent(dialog.loaded[0]);
+  assert.match(html, /backend files missing/);
+  assert.match(html, /backend files were removed, likely by an update\. Quit and reopen Kiro Crew/);
+  assert.doesNotMatch(html, /installation still finishing|still being installed|five minutes/);
+  assert.ok(html.includes(QUIT_ACCENTED), "the accent follows the sentence onto Quit");
+
+  timers.tick(INSTALLING_PROBE_MS);
+  assert.deepStrictEqual(dialog.scripts, [], "an unchanged probe repaints nothing");
+
+  state.pruned = false;
+  timers.tick(INSTALLING_PROBE_MS);
+  assert.match(dialog.completionChrome(), /installation finished/);
+  timers.fire(INSTALLING_COMPLETE_LINGER_MS);
+  await flush();
+  assert.strictEqual(spawnCalls.length, 2, "the returned backend is started by the dialog's own retry");
+  assert.strictEqual(spawnCalls[1][0], BUNDLED_BIN);
+});
+
+// Retry starts a fresh launch, which resets the stale-asset budget; the dialog
+// it reopens must still describe the removed backend, not an install.
+test("a Retry from the removed-files dialog reopens it with the same copy", async () => {
+  const { windows } = await windowsNoBundleDialog({ pruneMidRun: true });
+  windows[0].click("retry");
+  await flush();
+  await flush();
+  assert.strictEqual(windows.length, 2, "the refusal reopened the dialog");
+  const html = decodeURIComponent(windows[1].loaded[0]);
+  assert.match(html, /backend files were removed/);
+  assert.doesNotMatch(html, /still being installed/);
+});
+
+// A launch that never saw a backend has no incident behind it, so it keeps the
+// install copy (an installer may still be writing the tree).
+test("a packaged Windows app that boots with no bundle keeps the install copy", async () => {
+  const { windows } = await windowsNoBundleDialog({ pruneMidRun: false });
+  const html = decodeURIComponent(windows[0].loaded[0]);
+  assert.match(html, /installation still finishing/);
+  assert.match(html, /still being installed/);
+  assert.doesNotMatch(html, /backend files were removed/);
+  assert.ok(!html.includes(QUIT_ACCENTED));
 });
 
 test("a packaged Windows app that boots with no bundle reports it instead of spawning from PATH", async () => {

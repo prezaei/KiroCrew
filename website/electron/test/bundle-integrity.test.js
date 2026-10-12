@@ -10,6 +10,8 @@ const {
   describeIncompleteBundle,
   nextInstallingDialogState,
   INSTALLING_DIALOG_TITLE,
+  PRUNED_BACKEND_MESSAGE,
+  PRUNED_DIALOG_TITLE,
   shouldReclassifyAsInstalling,
 } = require("../bundle-integrity");
 
@@ -625,5 +627,30 @@ describe("nextInstallingDialogState", () => {
       assert.match(state.message, /starts on its own/i);
       assert.ok(!/Wait, then retry/.test(state.message), `manual voice leaked: ${state.message}`);
     }
+  });
+
+  // After a stale-bundle incident the backend tree was removed, not half
+  // written: the copy leads with quit-and-reopen and promises no install.
+  it("names the removed backend and leads with quit and reopen when pruned", () => {
+    for (const unknown of [null, undefined]) {
+      const state = nextInstallingDialogState(unknown, { pruned: true });
+      assert.equal(state.complete, false);
+      assert.equal(state.title, PRUNED_DIALOG_TITLE);
+      assert.equal(state.message, PRUNED_BACKEND_MESSAGE);
+      assert.match(state.message, /^Kiro Crew's backend files were removed/);
+      assert.ok(
+        state.message.indexOf("Quit and reopen") < state.message.indexOf("reinstall"),
+        "quit and reopen comes before reinstall",
+      );
+      assert.ok(!/being installed|five minutes|few minutes/.test(state.message), `install wait leaked: ${state.message}`);
+      assert.match(state.message, /starts on its own/, "the probe's auto-start is still promised");
+    }
+  });
+
+  // Files arriving at a probed path again are an install in progress, so the
+  // count copy and the completion frame are unchanged by the pruned flag.
+  it("keeps the install copy once parts are found, pruned or not", () => {
+    assert.deepEqual(nextInstallingDialogState(["a", "b"], { pruned: true }), nextInstallingDialogState(["a", "b"]));
+    assert.deepEqual(nextInstallingDialogState([], { pruned: true }), nextInstallingDialogState([]));
   });
 });

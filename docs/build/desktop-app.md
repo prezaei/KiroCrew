@@ -980,7 +980,12 @@ the matching backend in a universal app:
    install manager leaves it mid-update, and what `PATH` names is not this app's
    backend. The launch shows the "installation still finishing" dialog instead,
    whose probe re-runs this resolution and starts the backend once a probed path
-   is back. Unpackaged (source checkout) launches keep the `PATH` fallback.
+   is back. When the refusal follows a stale-asset re-resolve, the tree the app
+   was running from was removed and nothing is installing, so the same dialog
+   says the backend files were removed and asks the user to quit and reopen the
+   app (or reinstall), with the accent on Quit; the probe stays armed. This
+   holds across a Retry and clears once a launcher resolves to a real backend.
+   Unpackaged (source checkout) launches keep the `PATH` fallback.
 
 The function is pure — `fs`, `os`, `path`, `process.resourcesPath`,
 `__dirname`, and the arch are injected — so both arch branches are

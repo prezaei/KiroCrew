@@ -187,6 +187,18 @@ const INSTALLED_DIALOG_TITLE = "Kiro Crew — installation finished";
 // dialog vanishing mid-sentence.
 const BUNDLE_COMPLETE_MESSAGE = "Installation finished — starting Kiro Crew…";
 
+// The dialog's copy when the backend tree this app was running from is gone
+// after a stale-bundle incident: an install manager pruned the running
+// version's directory, so nothing is installing and waiting cannot help. The
+// remedy comes first and names the Quit button on screen; reopening starts the
+// installed version. The last sentence keeps the probe's promise, because a
+// backend that comes back at a probed path still starts on its own.
+const PRUNED_DIALOG_TITLE = "Kiro Crew — backend files missing";
+const PRUNED_BACKEND_MESSAGE = "Kiro Crew's backend files were removed, likely by "
+  + "an update. Quit and reopen Kiro Crew (the Quit button below); if that does "
+  + "not help, reinstall the Kiro Crew app. If the files come back, Kiro Crew "
+  + "starts on its own.";
+
 /**
  * Which bundle parts would make spawnGateway REFUSE to launch `bin` right now.
  *
@@ -238,10 +250,16 @@ function launchBlockingBundleParts(fs, path, bin) {
  * @param {string[]|null} missing  from launchBlockingBundleParts. null (launcher
  *   not resolvable yet) is still installing with an unknown count; only an
  *   empty ARRAY is complete.
+ * @param {{pruned?: boolean}} [options]  `pruned` when the refusal followed a
+ *   stale-bundle incident, so an unresolvable launcher means the backend tree
+ *   was removed rather than not written yet.
  * @returns {{complete: boolean, title: string, message: string}}
  */
-function nextInstallingDialogState(missing) {
+function nextInstallingDialogState(missing, { pruned = false } = {}) {
   if (!Array.isArray(missing)) {
+    if (pruned) {
+      return { complete: false, title: PRUNED_DIALOG_TITLE, message: PRUNED_BACKEND_MESSAGE };
+    }
     // Still the auto-retry dialog: the probe is armed and will fire, so the
     // copy must keep promising that rather than switching to a manual "retry".
     return {
@@ -409,5 +427,7 @@ module.exports = {
   describeIncompleteBundle,
   nextInstallingDialogState,
   INSTALLING_DIALOG_TITLE,
+  PRUNED_BACKEND_MESSAGE,
+  PRUNED_DIALOG_TITLE,
   shouldReclassifyAsInstalling,
 };
