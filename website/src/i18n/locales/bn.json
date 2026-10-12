@@ -327,6 +327,8 @@
     "k_run_a_command": "কমান্ড চালান",
     "open_command_bar": "Command Bar খুলুন",
     "focus_mode": "ফোকাস মোড",
+    "focus_mode_on_announce": "ফোকাস মোড চালু আছে। এটি বন্ধ করতে {{chord}} চাপুন।",
+    "focus_mode_on_announce_unbound": "ফোকাস মোড চালু আছে। এর শর্টকাট নির্ধারিত নেই; কীবোর্ড থেকে ফোকাস মোড বন্ধ করতে শর্টকাট পেজে এটি আবার নির্ধারণ করুন।",
     "focus_mode_title": "ফোকাস মোড · Alt+Shift+M",
     "focus_mode_title_mac": "ফোকাস মোড · ⌥⇧M",
     "connect_your_phone": "ফোন সংযুক্ত করুন",

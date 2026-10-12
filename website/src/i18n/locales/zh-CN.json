@@ -323,6 +323,8 @@
     "k_run_a_command": "运行命令",
     "open_command_bar": "打开 Command Bar",
     "focus_mode": "专注模式",
+    "focus_mode_on_announce": "专注模式已开启。按 {{chord}} 可关闭。",
+    "focus_mode_on_announce_unbound": "专注模式已开启。其快捷键未绑定；请在快捷键页面重新绑定，以便用键盘关闭专注模式。",
     "focus_mode_title": "专注模式 · Alt+Shift+M",
     "focus_mode_title_mac": "专注模式 · ⌥⇧M",
     "connect_your_phone": "连接手机",

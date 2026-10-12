@@ -323,6 +323,8 @@
     "k_run_a_command": "명령 실행",
     "open_command_bar": "Command Bar 열기",
     "focus_mode": "집중 모드",
+    "focus_mode_on_announce": "집중 모드가 켜졌습니다. {{chord}} 키를 누르면 꺼집니다.",
+    "focus_mode_on_announce_unbound": "집중 모드가 켜졌습니다. 단축키가 지정되어 있지 않습니다. 키보드로 집중 모드를 끄려면 단축키 페이지에서 다시 지정하세요.",
     "focus_mode_title": "집중 모드 · Alt+Shift+M",
     "focus_mode_title_mac": "집중 모드 · ⌥⇧M",
     "connect_your_phone": "휴대폰 연결",

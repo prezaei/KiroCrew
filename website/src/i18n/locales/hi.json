@@ -327,6 +327,8 @@
     "k_run_a_command": "कमांड चलाएं",
     "open_command_bar": "Command Bar खोलें",
     "focus_mode": "फ़ोकस मोड",
+    "focus_mode_on_announce": "फ़ोकस मोड चालू है। इसे बंद करने के लिए {{chord}} दबाएँ।",
+    "focus_mode_on_announce_unbound": "फ़ोकस मोड चालू है। इसका शॉर्टकट असाइन नहीं है; कीबोर्ड से फ़ोकस मोड बंद करने के लिए शॉर्टकट पेज पर इसे फिर से असाइन करें।",
     "focus_mode_title": "फ़ोकस मोड · Alt+Shift+M",
     "focus_mode_title_mac": "फ़ोकस मोड · ⌥⇧M",
     "connect_your_phone": "फ़ोन कनेक्ट करें",

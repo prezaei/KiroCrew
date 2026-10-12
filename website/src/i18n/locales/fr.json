@@ -331,6 +331,8 @@
     "k_run_a_command": "Executer une commande",
     "open_command_bar": "Ouvrir Command Bar",
     "focus_mode": "Mode concentration",
+    "focus_mode_on_announce": "Mode concentration activé. Appuyez sur {{chord}} pour le désactiver.",
+    "focus_mode_on_announce_unbound": "Mode concentration activé. Son raccourci n’est pas attribué ; réattribuez-le sur la page des raccourcis pour désactiver le mode concentration au clavier.",
     "focus_mode_title": "Mode concentration · Alt+Maj+M",
     "focus_mode_title_mac": "Mode concentration · ⌥⇧M",
     "connect_your_phone": "Connecter votre téléphone",
