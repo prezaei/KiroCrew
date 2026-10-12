@@ -1187,6 +1187,16 @@ FIELDS: tuple[Field, ...] = (
             "it after the build when lineage corroborates"
         ),
     ),
+    # NO ``manager`` row, deliberately, and not beside ``created_by``: the two look
+    # alike and are stored in opposite places. The crew log is the ONLY store for who
+    # manages a session -- ``session_control.rebuild_managers_from_log`` reads it from
+    # the log and re-validates it before publishing -- so a copy on this line would be
+    # written on every save, read on every restore and then overwritten every time. A
+    # field nobody trusts is worse than no field: it would itself be the way a revoked
+    # manager came back, because a line can outlive the grant it names. ``created_by``
+    # stays because nothing else records it. What the line DOES carry is a marker that a
+    # handoff committed (``manager_handed_over``), which says whether the log has to be
+    # read and never who it names -- see ``apply`` below.
     Field(
         "folder_id",
         _ALL,
@@ -1670,6 +1680,35 @@ def apply(
     reader's own rollback owns the slot it created.
     """
     applied = AppliedMeta(slot=slot, purpose=purpose, meta=meta)
+    # The handed-over MARKER decides whether this slot's manager has to be read at all.
+    # The line never carries the manager -- the crew log is the only store for that --
+    # but it carries ``manager_handed_over`` once a handoff of this session committed.
+    #
+    # Unmarked: never handed over, so the creator holds it, and that is DECIDED here
+    # without reading any history. Marked: UNRESOLVED until the log is read, because an
+    # empty field would otherwise read as "the creator holds it" -- a claim the log may
+    # contradict. Cleared only by ``session_control.resolve_slot_manager`` on an
+    # authoritative read, which keeps a build path that forgets that read fail closed
+    # for exactly the slots where forgetting could hand a revoked giver its reach back.
+    # Set BEFORE the field table runs, so a row that raises still leaves a marked slot
+    # denied rather than half-built and servable.
+    #
+    # Read straight off the line and NOT through a field row, on purpose: a row would
+    # make the slot save own the key, and a save from any slot object that had not
+    # hydrated it would then erase it. Unowned, it is carried through every rebuild of
+    # the line by ``history.carry_unowned_metadata``.
+    # Published through ``publish_manager`` and not written here, because the four
+    # attributes that say who manages a slot are one statement with one writer -- a
+    # hydrate that set the flag alone would be the twenty-second place able to write
+    # part of it, which is the shape the funnel exists to remove.
+    from kiro_crew.dashboard.session_control import (
+        MANAGER_HANDED_OVER_META_KEY,
+        publish_manager,
+    )
+
+    handed_over = meta.get(MANAGER_HANDED_OVER_META_KEY) is True
+    slot._manager_handed_over = handed_over
+    publish_manager(slot, manager="", manager_tab="", unresolved=handed_over)
     read = _Read(state=state, slot=slot, meta=meta, purpose=purpose, applied=applied)
     for row in FIELDS:
         if row.read is not None and purpose.purpose in row.purposes:

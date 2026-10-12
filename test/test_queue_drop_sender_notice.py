@@ -100,7 +100,14 @@ def test_session_send_stamps_the_sending_slot(tmp_path):
 
     assert out["started"] is False
     entry_meta = target._queue[0]["meta"]
+    # ROUTING names where a drop notice may be addressed; PROVENANCE records who sent it
+    # and whether the ownership fence applied, which is what the drain re-checks. Two
+    # keys because the restore path strips the first and must keep the second.
     assert entry_meta[sc.SEND_ORIGIN_META_KEY] == {"slot": caller.key, "tab": caller._tab_id}
+    assert entry_meta[sc.ADMISSION_PROVENANCE_META_KEY] == {
+        "sender": caller.key,
+        "fenced": False,
+    }
     # The stamp rides ALONGSIDE the containment snapshot; it never displaces it,
     # because that snapshot is the drain's authorization input.
     assert entry_meta[sc.QUEUED_CONTAINMENT_META_KEY]
@@ -203,14 +210,16 @@ def test_requeued_steer_notifies_its_sender(tmp_path):
     target._pending_steers = ["stop and reread the spec"]
     target._steer_admissions["stop and reread the spec"] = {
         **sc.containment_meta(state, target),
-        **sc.send_origin_meta(state, caller.key),
+        **sc.send_origin_meta(state, caller.key, manager_fenced=False),
     }
 
     cr._requeue_unconsumed_steers(state, target)
-    assert target._queue[0]["meta"][sc.SEND_ORIGIN_META_KEY] == {
-        "slot": caller.key,
-        "tab": caller._tab_id,
-    }
+    requeued = target._queue[0]["meta"]
+    assert requeued[sc.SEND_ORIGIN_META_KEY] == {"slot": caller.key, "tab": caller._tab_id}
+    assert requeued[sc.ADMISSION_PROVENANCE_META_KEY] == {
+        "sender": caller.key,
+        "fenced": False,
+    }, "the requeue keeps what the drain re-checks, not only where to report"
 
     _link(target)
     cr._drop_stale_admissions(state, target)
@@ -275,7 +284,7 @@ def test_self_send_gets_one_notice_not_two(tmp_path):
         "my own follow-up",
         _never_runs,
         state,
-        extra_meta=sc.send_origin_meta(state, slot.key),
+        extra_meta=sc.send_origin_meta(state, slot.key, manager_fenced=False),
     )
 
     _link(slot)
@@ -307,7 +316,7 @@ def test_exempt_entries_are_not_dropped_so_nobody_is_told(tmp_path):
     state = _make_state(tmp_path)
     caller = state.get_or_create_slot("chat-1")
     slot = _busy(_link(state.get_or_create_slot("chat-2")))
-    origin = sc.send_origin_meta(state, caller.key)
+    origin = sc.send_origin_meta(state, caller.key, manager_fenced=False)
     slot.queue_append("cron fired", CRON_NOTIFICATION_KIND, dict(origin))
     slot.queue_append("subagent finished", SUBAGENT_COMPLETION_KIND, dict(origin))
 
@@ -326,25 +335,33 @@ def test_send_origin_meta_omits_an_empty_key(tmp_path):
     state = _make_state(tmp_path)
     caller = state.get_or_create_slot("chat-7")
 
-    assert sc.send_origin_meta(state, "") == {}
-    assert sc.send_origin_meta(state, "chat-7") == {
-        sc.SEND_ORIGIN_META_KEY: {"slot": "chat-7", "tab": caller._tab_id}
-    }
+    assert sc.send_origin_meta(state, "", manager_fenced=False) == {}
+    for fenced in (False, True):
+        assert sc.send_origin_meta(state, "chat-7", manager_fenced=fenced) == {
+            sc.SEND_ORIGIN_META_KEY: {"slot": "chat-7", "tab": caller._tab_id},
+            sc.ADMISSION_PROVENANCE_META_KEY: {"sender": "chat-7", "fenced": fenced},
+        }
 
 
 def test_send_origin_meta_omits_a_key_with_no_tab_identity(tmp_path):
-    """A stamp whose identity cannot be checked later must not exist.
+    """A ROUTING stamp whose identity cannot be checked later must not exist.
 
     Two shapes reach here: a key naming no live slot, and a live slot carrying no
-    ``_tab_id``. Stamping either would leave the drop resolving a recipient it
-    cannot verify, which is the whole hazard, so both omit the key instead.
+    ``_tab_id``. Stamping routing for either would leave the drop resolving a
+    recipient it cannot verify, which is the whole hazard, so both omit it.
+
+    PROVENANCE is still written, because nothing is ever written THROUGH it -- it is
+    only compared. Omitting it with the routing stamp is what let a tab-less sender's
+    queued message skip the drain's sender re-check.
     """
     state = _make_state(tmp_path)
     tabless = state.get_or_create_slot("chat-9")
     tabless._tab_id = ""
 
-    assert sc.send_origin_meta(state, "chat-never-existed") == {}
-    assert sc.send_origin_meta(state, "chat-9") == {}
+    for key in ("chat-never-existed", "chat-9"):
+        meta = sc.send_origin_meta(state, key, manager_fenced=True)
+        assert sc.SEND_ORIGIN_META_KEY not in meta, key
+        assert meta[sc.ADMISSION_PROVENANCE_META_KEY] == {"sender": key, "fenced": True}
 
 
 def test_the_stamp_carries_both_fields_or_neither(tmp_path):
@@ -356,7 +373,7 @@ def test_the_stamp_carries_both_fields_or_neither(tmp_path):
     """
     state = _make_state(tmp_path)
     caller = state.get_or_create_slot("chat-1")
-    meta = sc.send_origin_meta(state, caller.key)
+    meta = sc.send_origin_meta(state, caller.key, manager_fenced=False)
 
     assert sc.send_origin_slot(meta) == caller.key
     assert sc.send_origin_tab(meta) == caller._tab_id
