@@ -1316,20 +1316,51 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
     ),
     DeniedCommandRule(
         id="local-destructive-rm-rf-root",
-        pattern="rm -rf /.*",
+        # Scoped to the filesystem ROOT ITSELF, not every ``/``-rooted path.  The
+        # old ``rm -rf /.*`` refused ordinary cleanup (``rm -rf /tmp/x``,
+        # ``sudo rm -rf /opt/old``) even though deleting a NAMED child is routine
+        # and the floor already allows those descendants in every other flag
+        # spelling (``rm -fr /tmp/x`` never matched this literal ``rm -rf`` row).
+        # The lookahead fires only when the operand after ``/`` is root itself or a
+        # whole-root expansion -- end / whitespace / a separator (``; & | ) #``) /
+        # quote / a second ``/`` (``///``) / a segment STARTING with a glob char
+        # (``/*``, ``/?``, ``/[!.]*`` -- expands to many top-level entries) / a
+        # dot-only segment (``/.``, ``/..``) -- so a named child (``/tmp``) with a
+        # word char after the slash does not match.  Matched via ``re.search`` over
+        # the raw command AND the command-shape deny-views, which canonicalize a
+        # re-quoted spelling (``rm -rf "/"`` -> ``rm -rf /``) but do NOT expand
+        # ``~``/``$HOME`` or the ``-fr`` flag order -- so this row and its ``~``
+        # sibling keep the literal ``rm -rf`` contract they always had.  Path
+        # IDENTITY (``..`` out of a tree) stays the sensitive-path keystone's job.
+        pattern=r"rm -rf /(?=[\s/)#;&|'\"]|\Z|[*?\[]|\.\.?(?=[\s/)#;&|'\"]|\Z))",
         category="local-destructive",
         description=(
-            "Blocks recursive force-deletion rooted at the filesystem root (rm -rf /...), which "
-            "can wipe the entire operating system and all data."
+            "Blocks recursive force-deletion of the filesystem root itself (rm -rf /, "
+            "rm -rf /*, rm -rf /.., and the like), which can wipe the entire operating "
+            "system and all data. Deleting a named directory under root (rm -rf /tmp/x) "
+            "is ordinary cleanup and is allowed."
         ),
     ),
     DeniedCommandRule(
         id="local-destructive-rm-rf-home",
-        pattern="rm -rf ~.*",
+        # The ``~`` sibling, narrowed the same way: deny home ITSELF or a whole-home
+        # expansion (``~``, ``~/``, ``~//``, a glob-starting segment ``~*``/``~?``/
+        # ``~[``/``~/*``/``~/[!.]*``, or a dot-only segment ``~/.``/``~/..``), allow a
+        # named child (``~/.cache``).  The alternation is a non-capturing group: a
+        # TOP-LEVEL ``|`` fails ``is_safe_user_regex`` and would DISABLE the row.
+        pattern=(
+            r"rm -rf ~(?:"
+            r"(?=[\s;&|)#'\"]|\Z)"
+            r"|[*?\[]"
+            r"|/(?=[\s;&|)#'\"/]|\Z|[*?\[]|\.\.?(?=[\s;&|)#/'\"]|\Z))"
+            r")"
+        ),
         category="local-destructive",
         description=(
-            "Blocks recursive force-deletion of the user home directory (rm -rf ~...), which "
-            "would destroy all personal files and config."
+            "Blocks recursive force-deletion of the user home directory itself (rm -rf ~, "
+            "rm -rf ~/, rm -rf ~/*, and the like), which would destroy all personal files "
+            "and config. Deleting a named directory under home (rm -rf ~/.cache/foo) is "
+            "ordinary cleanup and is allowed."
         ),
     ),
     DeniedCommandRule(
@@ -1807,6 +1838,13 @@ _LEGACY_RULE_ID_BY_PATTERN: dict[str, str] = {
     # against an older catalog pins; the row itself is anchored to the command
     # token (``_NETCAT_EXEC_PATTERN``) and stays force-pinnable under that pin.
     "nc -e.*": "reverse-shell-nc",
+    # The pre-narrowing spellings of the two ``local-destructive`` rm rows. The
+    # rows still exist (narrowed to the dir itself), so an administrator ceiling
+    # pinning the old pattern text must keep forcing them on; without the alias
+    # the pin resolves to None, is dropped, and a user opt-out could then loosen
+    # a tightest-wins ceiling for ``rm -rf /`` / ``rm -rf ~``.
+    "rm -rf /.*": "local-destructive-rm-rf-root",
+    "rm -rf ~.*": "local-destructive-rm-rf-home",
 }
 
 
@@ -2224,16 +2262,16 @@ def _exception_applies(view: str, exceptions: list[str]) -> bool:
     return any(fnmatch.fnmatch(view, e.lower()) for e in exceptions)
 
 
-# Maps a deny pattern to the globs that exonerate it.  When an input matches
-# a deny pattern AND one of that pattern's exceptions, the deny is skipped.
-# This avoids a blanket allowlist that could bypass unrelated deny rules.
-#
-# Scoped to the two ``local-destructive`` rm rules: they are plain literal
-# strings, so they are the ones an ordinary search for their own subject
-# matter trips over.
+# Maps a deny pattern to the globs that exonerate it: when an input matches a
+# deny pattern AND one of its exceptions, the deny is skipped (no blanket
+# allowlist that could bypass unrelated rules).  Scoped to the two
+# ``local-destructive`` rm rows, so a read-only search for their own subject
+# (``grep "rm -rf /" src/``) is let through.  Keyed off each row's LIVE pattern
+# via ``_RULES_BY_ID``: ``is_denied`` resolves an exception by the pattern string
+# in the effective set, so a hard-coded key that drifted would drop the carve-out.
 _DENY_EXCEPTIONS: dict[str, list[str]] = {
-    "rm -rf /.*": list(_INERT_SEARCH_GLOBS),
-    "rm -rf ~.*": list(_INERT_SEARCH_GLOBS),
+    _RULES_BY_ID[_rule_id].pattern: list(_INERT_SEARCH_GLOBS)
+    for _rule_id in ("local-destructive-rm-rf-root", "local-destructive-rm-rf-home")
 }
 
 
