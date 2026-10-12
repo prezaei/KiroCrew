@@ -3134,8 +3134,6 @@ describe('New crewmate dialog', () => {
       workspace: '',
       memory_store: 'default',
       description: 'Triage new issues',
-      triggers: '',
-      session_color: '',
     }))
     // Roster re-read BEFORE the URL names the new crewmate, then its chat
     // opens through the verified thread endpoint, like any click would.
@@ -3191,15 +3189,15 @@ describe('New crewmate dialog', () => {
     await openDialog()
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'radar' } })
     fireEvent.click(screen.getByTestId('crewmate-create-advanced-toggle'))
-    const triggers = await screen.findByLabelText('Triggers')
+    const workspace = await screen.findByRole('combobox', { name: 'Workspace' })
     fireEvent.click(screen.getByTestId('crewmate-create-submit'))
     await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
     // The body is sent; a value typed now would never reach it and would be
     // lost when success closes the dialog — so nothing under the form takes
     // input: one disabled fieldset covers the fields that have no `disabled`
-    // prop of their own (workspace / model / triggers / colour) as well.
+    // prop of their own (workspace / model) as well.
     expect(screen.getByTestId('crewmate-create-fieldset')).toBeDisabled()
-    expect(triggers).toBeDisabled()
+    expect(workspace).toBeDisabled()
     expect(screen.getByTestId('crewmate-create-advanced-toggle')).toBeDisabled()
     expect(screen.getByLabelText('Name')).toBeDisabled()
     expect(screen.getByTestId('crewmate-create-submit')).toHaveTextContent('Creating…')
@@ -4504,9 +4502,6 @@ describe('New crewmate dialog', () => {
     const advanced = await screen.findByTestId('crewmate-create-advanced')
     // The same field components the editor mounts: workspace and model.
     expect(within(advanced).getByLabelText('Workspace')).toBeInTheDocument()
-    const colorInput = advanced.querySelector('input[type="color"]')
-    expect(colorInput).not.toBeNull()
-    expect(colorInput).toHaveValue('#4f8ef7')
     expect(within(advanced).getByLabelText('Edit default model')).toBeInTheDocument()
   })
 

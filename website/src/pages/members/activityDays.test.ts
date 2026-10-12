@@ -15,15 +15,15 @@ describe('groupActivityDays', () => {
       [
         { ts: at(0, 9), via: 'chat', project: '/a' },
         { ts: at(2, 8), via: 'chat', project: '/a' },
-        { ts: at(0, 12), via: 'select_crew', project: '/b' },
+        { ts: at(0, 12), via: 'chat', project: '/b' },
         { ts: at(2, 14), via: 'chat', project: '/b' },
         { ts: at(2, 11), via: 'chat', project: '/a' },
       ],
       false,
     )
     expect(days.map((d) => d.dayStart)).toEqual([at(0, 0), at(2, 0)])
-    expect(days[0]).toMatchObject({ chats: 1, routed: 1, projects: ['/a', '/b'], isFloor: false })
-    expect(days[1]).toMatchObject({ chats: 3, routed: 0, projects: ['/a', '/b'] })
+    expect(days[0]).toMatchObject({ chats: 2, projects: ['/a', '/b'], isFloor: false })
+    expect(days[1]).toMatchObject({ chats: 3, projects: ['/a', '/b'] })
     expect(days[1].entries.map((e) => e.ts)).toEqual([at(2, 8), at(2, 11), at(2, 14)])
   })
 
@@ -35,6 +35,21 @@ describe('groupActivityDays', () => {
     ]
     expect(groupActivityDays(entries, false).map((d) => d.isFloor)).toEqual([false, false])
     expect(groupActivityDays(entries, true).map((d) => d.isFloor)).toEqual([false, true])
+  })
+
+  it('counts an entry an older build stored under the retired routing kind as a plain engagement', () => {
+    // A log written before crew routing was retired may still hold `via:
+    // "select_crew"` entries; they are days the crewmate was engaged, so they
+    // count like any other entry rather than vanishing from the week.
+    const days = groupActivityDays(
+      [
+        { ts: at(0, 9), via: 'chat', project: '/a' },
+        { ts: at(0, 10), via: 'select_crew', project: '/a' },
+      ],
+      false,
+    )
+    expect(days).toHaveLength(1)
+    expect(days[0]).toMatchObject({ chats: 2, projects: ['/a'] })
   })
 
   it('returns nothing for an empty log', () => {
