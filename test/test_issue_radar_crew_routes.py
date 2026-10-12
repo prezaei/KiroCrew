@@ -660,6 +660,44 @@ class TestCrewReadUpdateRetire(_CrewRouteCase):
         page = _payload(await self.call("GET", "/crew", query=query))
         self.assertEqual(page["triage_model_unavailable"], "claude-haiku-4.5")
 
+    async def test_the_crew_page_names_a_hand_picked_model_and_resume_releases_it(self):
+        from kiro_crew.apps.builtins.issue_radar.backend import crew_model
+
+        crew = self.crew("Andromeda", model="claude-opus-4.5", triage_model="claude-haiku-4.5")
+        query = {"owner": OWNER, "repo": REPO, "id": crew["id"]}
+        page = _payload(await self.call("GET", "/crew", query=query))
+        self.assertIs(page["model_held"], False)
+        self.assertEqual(page["held_model"], "")
+
+        slot = _Slot()
+        slot.model = "claude-sonnet-4.5"  # type: ignore[attr-defined]
+        self.state._slot = slot
+        off_loop(
+            crew_store.set_crew_model_held,
+            OWNER,
+            REPO,
+            crew["id"],
+            model="claude-opus-4.5",
+            triage_model="claude-haiku-4.5",
+            root=self.root,
+        )
+        page = _payload(await self.call("GET", "/crew", query=query))
+        self.assertIs(page["model_held"], True)
+        self.assertEqual(page["held_model"], "claude-sonnet-4.5")
+
+        # "Resume switching": a patch may release the hold, in the record and in
+        # process memory, but never set it.
+        crew_model._held[crew["id"]] = ("claude-opus-4.5", "claude-haiku-4.5")
+        self.addCleanup(crew_model._held.clear)
+        body = {"owner": OWNER, "repo": REPO, "id": crew["id"]}
+        res = await self.call("PUT", "/crew", body={**body, "model_held": False})
+        self.assertIs(_payload(res)["crew"]["model_held"], False)
+        self.assertNotIn(crew["id"], crew_model._held)
+        page = _payload(await self.call("GET", "/crew", query=query))
+        self.assertIs(page["model_held"], False)
+        res = await self.call("PUT", "/crew", body={**body, "model_held": True})
+        self.assertIs(_payload(res)["crew"]["model_held"], False)
+
     async def test_a_rename_onto_a_taken_name_is_409(self):
         first = self.crew("Andromeda")
         self.crew("Whirlpool")
