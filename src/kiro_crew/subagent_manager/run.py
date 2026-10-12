@@ -117,6 +117,7 @@ if TYPE_CHECKING:
         process_survived_async,
         provider_fallback_active,
         read_tombstone,
+        refresh_live_process_tree,
         refuse_stale_switch,
         replace_stale_shared_session,
         reproject_claimed_session,
@@ -754,17 +755,22 @@ class RunEventCoordinator(ManagerComponent):
             # reaper finds the map empty and reads this entry instead. On a map
             # miss here the roles are reversed and the entry is the reaper's.
             # Every process the key names is a candidate, each on its own handle.
-            pairs = self._manager._sessions_under(session_key)
-            handles = self._manager._retain_process_handles(info.id, session_key, pairs)
-            seen = [session for session, _handle in pairs]
-            # Under a scope whose hook takes the handle of the exact session the
-            # reset pops (a successor a cold start registered after the snapshot);
-            # a popped session with no pid the snapshot never saw is a kill
-            # failure, one it saw names no process (see ``_force_reap``).
-            reset_kwargs, popped = teardown_capture(self._manager._sessions, session_key)
+            # The tree is re-walked first so children this run's turns started
+            # are on the handle and can vouch for the group once the leader exits;
+            # inside the try, so a cancellation during the walk is recorded as an
+            # undecided kill like one during the reset.
             kill_failed: str | None = None
             fallback_ran = False
             try:
+                await refresh_live_process_tree(self._manager._sessions, session_key)
+                pairs = self._manager._sessions_under(session_key)
+                handles = self._manager._retain_process_handles(info.id, session_key, pairs)
+                seen = [session for session, _handle in pairs]
+                # Under a scope whose hook takes the handle of the exact session the
+                # reset pops (a successor a cold start registered after the snapshot);
+                # a popped session with no pid the snapshot never saw is a kill
+                # failure, one it saw names no process (see ``_force_reap``).
+                reset_kwargs, popped = teardown_capture(self._manager._sessions, session_key)
                 try:
                     await asyncio.wait_for(
                         self._manager._sessions.reset(session_key, **reset_kwargs),
