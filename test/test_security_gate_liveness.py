@@ -249,7 +249,11 @@ def _url_payload_command(n: int) -> str:
 #: write redirect exactly as the read-only tier does, and for ``_DEVNULL_REDIR_RE``
 #: ending each discard idiom where bash ends the word, with its classes spelled out
 #: so a Unicode space or digit cannot pose as one. No verb or allowlist moved.
-_PACKAGE_LINE_BUDGET = 28_857
+#:
+#: Raised again, from 28,857, for the ``engines`` leaf in ``paths.py``: the KAS
+#: engine bundle the gateway installs and later executes joins the file-tool floor
+#: beside ``playwright-cli`` -- one entry and its reason. No matcher moved.
+_PACKAGE_LINE_BUDGET = 28_860
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
