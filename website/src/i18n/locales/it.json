@@ -18074,6 +18074,7 @@
       "roster_load_retry": "Riprova",
       "search_members": "Cerca compagni…",
       "add_member": "Nuovo compagno",
+      "add_member_resume_draft": "Riprendi la bozza del compagno",
       "slug_collision": "Questo compagno condivide il nome breve con {{name}}, la cui chat lo usa già. Rinomina uno dei due compagni perché ognuno abbia la propria chat.",
       "thread_open_failed": "Impossibile aprire la chat di questo compagno.",
       "thread_repair_failed": "Impossibile riconnettere questa chat. Riapri il compagno per riprovare.",

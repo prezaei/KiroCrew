@@ -881,7 +881,7 @@ function MemberRow({
  *  tokens follow `EmptyState` in components/ui.tsx; the face is the real ghost at
  *  full strength rather than EmptyState's 12%-opacity icon, because here the
  *  avatar IS the subject (what a crewmate looks like), not decoration. */
-function CrewmateEmptyHero({ onCreate, onAdvanced, held }: {
+function CrewmateEmptyHero({ onCreate, onAdvanced, held, draftWaiting }: {
   onCreate: () => void
   /** Opens the full New crewmate form (the header menu's Advanced row). */
   onAdvanced: () => void
@@ -893,6 +893,9 @@ function CrewmateEmptyHero({ onCreate, onAdvanced, held }: {
    * the dialog reads the same hold.
    */
   held: string | null
+  /** An unfinished guided draft waits behind the CTA: it then reads "Resume
+   *  crewmate draft" (see `guidedDraftWaiting`). */
+  draftWaiting: boolean
 }) {
   const { t } = useTranslation()
   return (
@@ -911,7 +914,7 @@ function CrewmateEmptyHero({ onCreate, onAdvanced, held }: {
         {...uiLocation('members.new')}
       >
         <Plus size={15} className="lucide-inline" aria-hidden="true" />
-        {t('pages.membersPage.add_member')}
+        {draftWaiting ? t('pages.membersPage.add_member_resume_draft') : t('pages.membersPage.add_member')}
       </Btn>
       {/* The full form stays reachable on an empty roster, where the header
           "+" menu (and its Advanced row) is hidden behind this hero. */}
@@ -988,6 +991,19 @@ export function createDraftFromHref(href: string | null, base: string): MeetCrew
   }
   if (url.origin !== origin || url.pathname !== '/members' || url.searchParams.get('create') !== '1') return null
   return { name: url.searchParams.get('name') ?? '', goal: url.searchParams.get('goal') ?? '' }
+}
+
+/** Does an in-app destination keep this page mounted? The route is matched by
+ *  pathname alone: every `/members?...` address renders this one component, so
+ *  a query-only change (the rail's bare `/members`, `?member=`, `?team=`)
+ *  unmounts none of its always-mounted surfaces. */
+export function staysOnMembersPage(to: string): boolean {
+  try {
+    return new URL(to, window.location.origin).pathname === '/members'
+  } catch {
+    // Not an address this page can place: treat it as a leave and let the guard ask.
+    return false
+  }
 }
 
 export default function MembersPage() {
@@ -1347,9 +1363,13 @@ export default function MembersPage() {
   // form (Advanced) is opened only while the guided draft is untouched.
   const guidedEditedRef = useRef(false)
   const guidedBusyRef = useRef(false)
+  // Mirrored into state for one reader, the create doors' label below; the
+  // refs stay the source for the event handlers, which must not wait a render.
+  const [guidedEdited, setGuidedEdited] = useState(false)
   const onDraftStateChange = useCallback(({ edited, busy }: { edited: boolean; busy: boolean }) => {
     guidedEditedRef.current = edited
     guidedBusyRef.current = busy
+    setGuidedEdited(edited)
   }, [])
   // The flow kept the user's edited draft over a new proposal: say so.
   const [draftKept, setDraftKept] = useState(false)
@@ -1400,6 +1420,14 @@ export default function MembersPage() {
   }
   const guidedOpen = guided.open
   const guidedDone = guided.onDone
+  // Every door to the guided flow (the switcher row, the "+" menu's New
+  // crewmate, the empty hero) says what opening it does: while an edited draft
+  // waits behind a hidden flow it resumes that draft, so the door reads
+  // "Resume crewmate draft" -- the one cue that the step-aside kept the user's
+  // work. Each door spells both keys inline: the find_ui index reads a
+  // registered control's label from its source, so the alternative must be a
+  // catalog key at the site, not a variable.
+  const guidedDraftWaiting = guidedEdited && !guidedOpen
   /** Hiding the guided flow preserves its form-owned draft state. */
   const closeGuided = useCallback((outcome: 'completed' | 'dismissed') => {
     if (guidedBusyRef.current) return
@@ -4146,7 +4174,7 @@ export default function MembersPage() {
               >
                 <Plus size={13} className="lucide-inline text-muted shrink-0" aria-hidden="true" />
                 <span className="flex-1 min-w-0 flex flex-col">
-                  <span {...uiLocation('members.add-menu.new')}>{t('pages.membersPage.add_member')}</span>
+                  <span {...uiLocation('members.add-menu.new')}>{guidedDraftWaiting ? t('pages.membersPage.add_member_resume_draft') : t('pages.membersPage.add_member')}</span>
                   {createHeld !== null && (
                     <span className="text-[11.5px] text-muted whitespace-normal" data-testid="member-add-crewmate-held">
                       {createHeld}
@@ -4418,7 +4446,7 @@ export default function MembersPage() {
             // instead (see the DM thread section), so the two panes never
             // show the same hero twice on a wide viewport.
             <li className="md:hidden">
-              <CrewmateEmptyHero onCreate={() => openGuided()} onAdvanced={openAdvanced} held={createHeld} />
+              <CrewmateEmptyHero onCreate={() => openGuided()} onAdvanced={openAdvanced} held={createHeld} draftWaiting={guidedDraftWaiting} />
             </li>
           )}
           {loadError && (
@@ -4575,7 +4603,7 @@ export default function MembersPage() {
             team view too: a team can exist before its first crewmate does,
             and the pane is the team's then. */}
         {!active && !activeTeam && !postCreateError && loaded && !loadError && hasNoCrewmates(members) && (
-          <CrewmateEmptyHero onCreate={() => openGuided()} onAdvanced={openAdvanced} held={createHeld} />
+          <CrewmateEmptyHero onCreate={() => openGuided()} onAdvanced={openAdvanced} held={createHeld} draftWaiting={guidedDraftWaiting} />
         )}
         {/* A failed roster read at md and up: the roster column shows its own
             notice, but this column would otherwise be blank — no chat can
@@ -4711,6 +4739,7 @@ export default function MembersPage() {
                     if (m) void openMember(m)
                   }}
                   onCreate={createHeld ? undefined : () => openGuided()}
+                  draftWaiting={guidedDraftWaiting}
                   onShowRoster={() => setRosterPin(true)}
                   openRequest={switcherOpenRequest}
                 />
@@ -5255,6 +5284,18 @@ export default function MembersPage() {
             // The shell's leave registry is synchronous, so this page's own
             // `window.confirm` asks, as its other guards here do.
             confirmLeave={(message) => window.confirm(message)}
+            // A destination on this page (the rail's Crewmates row, a palette
+            // jump to `/members`) unmounts nothing: the flow stays mounted and
+            // its draft survives hidden, so there is nothing to confirm.
+            // Confirming would warn about a loss that cannot happen -- and the
+            // wizard would stay on screen after "Leave", since the page it
+            // belongs to never left.
+            draftSurvives={staysOnMembersPage}
+            // The gesture means "show me the page": once every guard here has
+            // agreed (the Schedules form may still refuse for its own draft),
+            // the flow steps aside the way choosing a chat does
+            // (`leaveGuided`) and the draft resumes on the next New crewmate.
+            onDraftSurvived={() => closeGuided('dismissed')}
             onOpenMember={(key) => {
               closeGuided('completed')
               openCreatedMember(key)

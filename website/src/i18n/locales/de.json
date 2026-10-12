@@ -17821,6 +17821,7 @@
       "roster_load_retry": "Noch einmal versuchen",
       "search_members": "Crewmates suchen…",
       "add_member": "Neuer Crewmate",
+      "add_member_resume_draft": "Crewmate-Entwurf fortsetzen",
       "slug_collision": "Dieser Crewmate teilt seinen Kurznamen mit {{name}}, dessen Chat ihn bereits verwendet. Benenne einen der beiden Crewmates um, damit jeder seinen eigenen Chat erhält.",
       "thread_open_failed": "Der Chat dieses Crewmates konnte nicht geöffnet werden.",
       "thread_repair_failed": "Dieser Chat konnte nicht wieder verbunden werden. Öffne den Crewmate erneut, um es noch einmal zu versuchen.",

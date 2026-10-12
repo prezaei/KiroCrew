@@ -3,12 +3,27 @@ import { useLocation, useNavigate, useNavigationType } from 'react-router-dom'
 import { arrivedByFreshNavigation, isTrapEntry, routerEntry, type TrapEntryState } from '../lib/routeHistoryPosition'
 
 /** The mounted page's answer to "may I navigate away from you?". `true` allows
- *  the navigation, `false` keeps the user exactly where they are. */
-export type NavigationLeaveGuard = () => boolean
+ *  the navigation, `false` keeps the user exactly where they are.
+ *
+ *  `to` is the destination address (pathname plus query) when the exit knows
+ *  it -- a rail row, a palette jump, a guarded handler with a `to`. A surface
+ *  that stays mounted at that address holds nothing the navigation can
+ *  destroy, so it may answer `true` without asking: the Crewmates page keeps
+ *  its guided create flow, draft and all, through every `/members?...`
+ *  change. An exit with no known destination (the browser's Back, a history
+ *  step) passes `undefined`, and the guard asks as if the page were leaving. */
+export type NavigationLeaveGuard = (to?: string) => boolean
+
+/** Told, with the same `to`, once EVERY guard has agreed to a navigation. A
+ *  surface that wants to react to a leave it allowed (step aside, drop a
+ *  timer) does it here, not inside its guard: a guard runs before the others
+ *  have answered, so an action taken there would stick to a navigation a later
+ *  guard then cancels. */
+export type NavigationLeaveAgreed = (to?: string) => void
 
 type Channel = {
-  register: (guard: NavigationLeaveGuard) => () => void
-  ask: () => boolean
+  register: (guard: NavigationLeaveGuard, agreed?: NavigationLeaveAgreed) => () => void
+  ask: (to?: string) => boolean
   /** Publish whether the page on screen is holding work an exit would destroy.
    *  Separate from `ask` because it must answer WITHOUT prompting: the browser
    *  Back guard needs to know there is something at stake before the user
@@ -62,6 +77,8 @@ export function NavigationLeaveGuardProvider({ children }: { children: React.Rea
   // still protected. Each registration removes only its own entry on cleanup, so an
   // outgoing surface cannot clear an incoming one's guard.
   const guards = React.useRef(new Set<NavigationLeaveGuard>())
+  // Keyed by the guard they belong to, so a registration's cleanup removes both.
+  const agreedListeners = React.useRef(new Map<NavigationLeaveGuard, NavigationLeaveAgreed>())
   // Kept in refs and pushed to listeners rather than held in state: the answer
   // flips on the keystroke that first dirties a draft, and state here would
   // re-render the whole app under this provider to tell one listener.
@@ -71,9 +88,13 @@ export function NavigationLeaveGuardProvider({ children }: { children: React.Rea
   const stakeHolders = React.useRef(new Set<object>())
   const stakeListeners = React.useRef(new Set<(atStake: boolean) => void>())
   const channel = React.useMemo<Channel>(() => ({
-    register: g => {
+    register: (g, agreed) => {
       guards.current.add(g)
-      return () => { guards.current.delete(g) }
+      if (agreed) agreedListeners.current.set(g, agreed)
+      return () => {
+        guards.current.delete(g)
+        agreedListeners.current.delete(g)
+      }
     },
     // A page with nothing at stake registers no guard and this is a bare
     // `true`. The guard may show a confirm, so callers must only ever ask from
@@ -84,10 +105,14 @@ export function NavigationLeaveGuardProvider({ children }: { children: React.Rea
     // has already said "stay" must not then be asked about a second draft for a
     // navigation that is no longer going to happen. Iterated over a copy, since a
     // guard's own confirm can unmount a surface and mutate the set.
-    ask: () => {
+    ask: (to) => {
       for (const g of [...guards.current]) {
-        if (g() === false) return false
+        if (g(to) === false) return false
       }
+      // Every guard agreed: the caller navigates next. Only now may a surface
+      // act on the leave (see `NavigationLeaveAgreed`). Over a copy, since a
+      // listener may unmount a surface and mutate the map.
+      for (const agreed of [...agreedListeners.current.values()]) agreed(to)
       return true
     },
     // Per PUBLISHER, for the same reason `register` keeps a set: one page can hold two
@@ -122,7 +147,7 @@ export function NavigationLeaveGuardProvider({ children }: { children: React.Rea
 }
 
 /** Publish this surface's veto to the app shell. */
-export function useRegisterNavigationLeaveGuard(guard: NavigationLeaveGuard) {
+export function useRegisterNavigationLeaveGuard(guard: NavigationLeaveGuard, agreed?: NavigationLeaveAgreed) {
   const channel = React.useContext(NavigationLeaveGuardContext)
   // Register a stable trampoline over a ref, not `guard` itself: the guard
   // closes over the draft, so a new closure arrives on every keystroke.
@@ -131,9 +156,11 @@ export function useRegisterNavigationLeaveGuard(guard: NavigationLeaveGuard) {
   // draft forever — losing exactly the text this exists to protect.
   const latest = React.useRef(guard)
   latest.current = guard
+  const latestAgreed = React.useRef(agreed)
+  latestAgreed.current = agreed
   React.useEffect(() => {
     if (!channel) return
-    return channel.register(() => latest.current())
+    return channel.register((to) => latest.current(to), (to) => latestAgreed.current?.(to))
   }, [channel])
 }
 
@@ -166,8 +193,9 @@ export function usePublishNavigationStake(atStake: boolean) {
 
 const ALWAYS_MAY_LEAVE = () => true
 
-/** Ask the page on screen before an action that navigates away from it. */
-export function useMayLeaveForNavigation(): () => boolean {
+/** Ask the page on screen before an action that navigates away from it. Pass
+ *  the destination when the caller knows it (see `NavigationLeaveGuard`). */
+export function useMayLeaveForNavigation(): (to?: string) => boolean {
   const channel = React.useContext(NavigationLeaveGuardContext)
   return channel?.ask ?? ALWAYS_MAY_LEAVE
 }
@@ -214,7 +242,7 @@ export function useGuardedLeave(): (perform: () => void | Promise<void>, to?: st
   const mayLeave = useMayLeaveForNavigation()
   const isCurrentUrl = useIsCurrentUrl()
   return React.useCallback((perform: () => void | Promise<void>, to?: string) => {
-    if (!(to !== undefined && isCurrentUrl(to)) && !mayLeave()) return
+    if (!(to !== undefined && isCurrentUrl(to)) && !mayLeave(to)) return
     // A returned promise is deliberately not awaited: the gate answers "may this
     // run", and the handler owns its own async failure path (each one already
     // catches and logs).

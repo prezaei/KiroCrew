@@ -53,6 +53,8 @@ export const LOCATIONS = {
   // while a create is held (to the hold reason), so the label is the text.
   'members.new': {
     kind: 'button',
+    // Reads "Resume crewmate draft" while a guided draft waits behind it.
+    label: { from: 'text', key: 'pages.membersPage.add_member' },
     terms: CREATE_TERMS,
     placements: [{ ...ON_PAGE, entry: 'content', requires: [{ kind: 'condition', id: 'no_crewmates' }] }],
   },
@@ -147,6 +149,7 @@ export const LOCATIONS = {
   // one (the empty roster's hero, `members.new`, is gone by then).
   'members.add-menu.new': {
     kind: 'menu-item',
+    // Reads "Resume crewmate draft" while a guided draft waits behind it.
     label: { from: 'text', key: 'pages.membersPage.add_member' },
     terms: CREATE_TERMS,
     placements: [{ surface: 'members', parent: 'members.add-menu', entry: 'menu' }],
@@ -154,6 +157,8 @@ export const LOCATIONS = {
   // The open crewmate's switcher list ends with the same create action.
   'members.switcher.new': {
     kind: 'menu-item',
+    // Reads "Resume crewmate draft" while a guided draft waits behind it.
+    label: { from: 'text', key: 'pages.membersPage.add_member' },
     terms: CREATE_TERMS,
     placements: [{ surface: 'members', parent: 'members.switcher', entry: 'menu' }],
   },

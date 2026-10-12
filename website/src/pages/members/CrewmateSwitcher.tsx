@@ -82,6 +82,7 @@ export default function CrewmateSwitcher({
   activeName,
   onPick,
   onCreate,
+  draftWaiting = false,
   onShowRoster,
   signals = rowOnlySignals,
   openRequest = 0,
@@ -100,6 +101,10 @@ export default function CrewmateSwitcher({
   onPick: (name: string) => void
   /** Opens the New crewmate dialog. Omitted while creation is held. */
   onCreate?: () => void
+  /** An unfinished guided draft waits behind the create row: it then reads
+   *  "Resume crewmate draft" instead of "New crewmate", so a user who left the
+   *  wizard can see the work was kept. */
+  draftWaiting?: boolean
   /** Pins the roster column back beside the thread. The page hides this chip
    *  while the column is open (it is the list the chip folds), so the action
    *  only ever shows; the column's own close lifts the pin. Omitted, the
@@ -360,7 +365,7 @@ export default function CrewmateSwitcher({
                 <span className="w-8 h-8 rounded-full bg-accent-subtle grid place-items-center" aria-hidden="true">
                   <Plus size={15} />
                 </span>
-                {t('pages.membersPage.add_member')}
+                {draftWaiting ? t('pages.membersPage.add_member_resume_draft') : t('pages.membersPage.add_member')}
               </button>
             )}
             {onShowRoster && (

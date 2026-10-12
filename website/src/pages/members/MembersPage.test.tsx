@@ -8,7 +8,7 @@ import { CREWMATES_PAGE_ENTERED_EVENT } from '../../components/MeetCrewmatesFlow
 import { Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { renderWithProviders } from '../../test/helpers'
 import { scopeOpen } from '../../guide/liveRegistry'
-import { NavigationLeaveGuardProvider, useMayLeaveForNavigation } from '../../components/NavigationLeaveGuard'
+import { NavigationLeaveGuardProvider, useMayLeaveForNavigation, useRegisterNavigationLeaveGuard } from '../../components/NavigationLeaveGuard'
 import { ApiError } from '../../api/apiError'
 import { memberProjectionStore } from '../../state/memberProjectionStore'
 import { markSlotUnread, sseConnected, sseDisconnected, sseSlots } from '../../store/dashboardSlice'
@@ -411,6 +411,7 @@ async function renderPage(
       <MembersPage />
       <LocationProbe />
       <LeaveProbe />
+      <RefusingGuardProbe />
       <GuideNavProbe />
     </NavigationLeaveGuardProvider>,
     { route, queryDefaults },
@@ -442,18 +443,42 @@ function GuideNavProbe() {
 }
 
 /** Stands in for an app-shell navigation surface (sidebar, palette, Back): asks
- *  the page's registered leave guard and records the answer. */
+ *  the page's registered leave guard and records the answer. The destination
+ *  buttons ask the way a rail row does, naming where the click goes; the bare
+ *  one asks the way Back does, naming nothing. */
 function LeaveProbe() {
   const mayLeave = useMayLeaveForNavigation()
   const [answer, setAnswer] = useState('')
   return (
-    <button type="button" data-testid="leave-probe" onClick={() => setAnswer(String(mayLeave()))}>
-      {answer}
-    </button>
+    <>
+      <button type="button" data-testid="leave-probe" onClick={() => setAnswer(String(mayLeave()))}>
+        {answer}
+      </button>
+      <button type="button" data-testid="leave-probe-members" onClick={() => setAnswer(String(mayLeave('/members')))}>to members</button>
+      <button type="button" data-testid="leave-probe-settings" onClick={() => setAnswer(String(mayLeave('/settings')))}>to settings</button>
+    </>
   )
 }
-const askToLeave = () => {
-  fireEvent.click(screen.getByTestId('leave-probe'))
+/** A second surface on the page that refuses every leave while armed -- what
+ *  the Schedules form is with a typed draft. Mounted on demand so it registers
+ *  AFTER the surface under test and is asked after it. */
+function RefusingGuard() {
+  useRegisterNavigationLeaveGuard(() => false)
+  return null
+}
+function RefusingGuardProbe() {
+  const [armed, setArmed] = useState(false)
+  return (
+    <>
+      <button type="button" data-testid="refusing-guard-toggle" onClick={() => setArmed((a) => !a)}>{armed ? 'armed' : 'off'}</button>
+      {armed && <RefusingGuard />}
+    </>
+  )
+}
+const toggleRefusingGuard = () => fireEvent.click(screen.getByTestId('refusing-guard-toggle'))
+
+const askToLeave = (to?: '/members' | '/settings') => {
+  fireEvent.click(screen.getByTestId(to === '/members' ? 'leave-probe-members' : to === '/settings' ? 'leave-probe-settings' : 'leave-probe'))
   return screen.getByTestId('leave-probe').textContent
 }
 
@@ -4812,6 +4837,79 @@ describe('MembersPage guided crewmate creation (embedded Meet CrewMates flow)', 
     expect(screen.getByTestId('chat-pane-stub')).toBe(stub)
     expect(hiddenByStyle(stub)).toBe(false)
     expect(chatPaneMounts.count).toBe(mountsBefore)
+  })
+
+  it('an untouched guided flow that steps aside leaves the create doors reading "New crewmate": nothing waits', async () => {
+    await openAssistant()
+    await clickAddCrewmate()
+    await waitFor(() => expect(flowOpen()).toBe(true))
+    fireEvent.click(within(pane()).getByTestId('meet-crewmates-not-now'))
+    await waitFor(() => expect(flowOpen()).toBe(false))
+    expect(await openAddMenu()).toHaveTextContent('New crewmate')
+    expect(screen.getByTestId('member-add-crewmate')).not.toHaveTextContent('Resume crewmate draft')
+    await closeAddMenu()
+  })
+
+  it('a rail click to this page while an edited guided draft is up asks nothing and steps the flow aside with the draft kept; a real leave still asks', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    try {
+      await openAssistant()
+      await clickAddCrewmate()
+      await waitFor(() => expect(flowOpen()).toBe(true))
+      fireEvent.change(goal(), { target: { value: 'Keep release notes up to date' } })
+      // The rail's Crewmates row lands on `/members`: this page stays mounted and
+      // the hidden draft with it, so there is nothing to discard and no question.
+      // The gesture means "show me the page": the flow steps aside like a chosen chat.
+      expect(askToLeave('/members')).toBe('true')
+      expect(confirmSpy).not.toHaveBeenCalled()
+      await waitFor(() => expect(flowOpen()).toBe(false))
+      expect(hiddenByStyle(screen.getByTestId('chat-pane-stub'))).toBe(false)
+      // The one cue that the work was kept: every door to the flow now says it
+      // resumes the draft rather than starting a new crewmate.
+      expect(await openAddMenu()).toHaveTextContent('Resume crewmate draft')
+      await closeAddMenu()
+      // The draft is exactly where the user left it on the next New crewmate.
+      await clickAddCrewmate()
+      await waitFor(() => expect(flowOpen()).toBe(true))
+      expect(goal().value).toBe('Keep release notes up to date')
+      // With the flow back on screen the door reads as the plain create again.
+      expect(await openAddMenu()).toHaveTextContent('New crewmate')
+      await closeAddMenu()
+      // Another page would unmount this one and the draft: asked, and a refusal keeps it.
+      expect(askToLeave('/settings')).toBe('false')
+      expect(confirmSpy).toHaveBeenCalledTimes(1)
+      expect(confirmSpy).toHaveBeenLastCalledWith('Leave this page? Your unsaved crewmate draft will be lost.')
+      expect(flowOpen()).toBe(true)
+      // An exit that names no destination (the browser's Back) is a leave too.
+      expect(askToLeave()).toBe('false')
+      expect(confirmSpy).toHaveBeenCalledTimes(2)
+      expect(flowOpen()).toBe(true)
+    } finally {
+      confirmSpy.mockRestore()
+    }
+  })
+
+  it('the flow steps aside only once every guard agreed: a second surface refusing the same leave keeps the wizard on screen', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    try {
+      await openAssistant()
+      await clickAddCrewmate()
+      await waitFor(() => expect(flowOpen()).toBe(true))
+      fireEvent.change(goal(), { target: { value: 'Half-written goal' } })
+      // Another draft on the page vetoes the navigation after this flow let it
+      // through: nothing navigates, so the flow must not have stepped aside.
+      toggleRefusingGuard()
+      expect(askToLeave('/members')).toBe('false')
+      expect(confirmSpy).not.toHaveBeenCalled()
+      expect(flowOpen()).toBe(true)
+      expect(goal().value).toBe('Half-written goal')
+      // The veto gone, the same leave is agreed by all and the flow steps aside.
+      toggleRefusingGuard()
+      expect(askToLeave('/members')).toBe('true')
+      await waitFor(() => expect(flowOpen()).toBe(false))
+    } finally {
+      confirmSpy.mockRestore()
+    }
   })
 
   it('the Advanced door never abandons an edited guided draft: it shows that draft again instead of a second form', async () => {

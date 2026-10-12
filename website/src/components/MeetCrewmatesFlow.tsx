@@ -217,14 +217,27 @@ function FocusSeat({ onMount }: { onMount: () => void }) {
  * changes and the browser's Back (the shell's channel) and a reload or tab
  * close (`beforeunload`). In-page controls are never intercepted.
  */
-export function DraftLeaveGuard({ message, confirmLeave }: {
+export function DraftLeaveGuard({ message, confirmLeave, survives, onSurvived }: {
   message: string
   /** The host page's synchronous ask (the shell's registry cannot await the
    *  app's confirm dialog). Without one, a route leave is not interrupted;
    *  the stake and the reload/close warning still hold. */
   confirmLeave?: (message: string) => boolean
+  /** Destinations the host stays mounted at with this draft intact: the
+   *  navigation goes through without asking, since nothing is lost. A pure
+   *  check, consulted only when the exit names its destination; an exit that
+   *  does not (the browser's Back) asks as if the page were leaving. */
+  survives?: (to: string) => boolean
+  /** Fired for a `survives` destination once EVERY guard on the page has
+   *  agreed and the caller is about to navigate -- never from the check
+   *  itself, which a later guard's refusal can still overrule. */
+  onSurvived?: (to: string) => void
 }) {
-  useRegisterNavigationLeaveGuard(() => (confirmLeave ? confirmLeave(message) : true))
+  const stays = (to?: string): to is string => to !== undefined && !!survives?.(to)
+  useRegisterNavigationLeaveGuard(
+    (to) => (stays(to) ? true : confirmLeave ? confirmLeave(message) : true),
+    (to) => { if (stays(to)) onSurvived?.(to) },
+  )
   usePublishNavigationStake(true)
   useEffect(() => {
     const warn = (e: BeforeUnloadEvent) => {
@@ -268,6 +281,8 @@ export default function MeetCrewmatesFlow({
   onDraftKept,
   onDraftStateChange,
   confirmLeave,
+  draftSurvives,
+  onDraftSurvived,
   onOpenMember,
 }: {
   open: boolean
@@ -306,6 +321,13 @@ export default function MeetCrewmatesFlow({
   /** Embedded: how the host page asks before a route leave would drop the
    *  draft. Passed to `DraftLeaveGuard`. */
   confirmLeave?: (message: string) => boolean
+  /** Embedded: destinations the host page stays mounted at, where the hidden
+   *  draft survives, so a route change there needs no confirm. A pure check,
+   *  passed to `DraftLeaveGuard`. */
+  draftSurvives?: (to: string) => boolean
+  /** Embedded: such a navigation is about to happen (every guard agreed).
+   *  The host decides what the flow does then, e.g. step aside. */
+  onDraftSurvived?: (to: string) => void
   /** Embedded: opens the new crewmate through the host's own guarded switch.
    *  Without it, the ready step navigates to its chat. */
   onOpenMember?: (key: string) => void
@@ -756,6 +778,8 @@ export default function MeetCrewmatesFlow({
     <DraftLeaveGuard
       message={busy ? t('pages.membersPage.create_leave_busy') : t('components.meetCrewmatesFlow.leave_draft')}
       confirmLeave={confirmLeave}
+      survives={draftSurvives}
+      onSurvived={onDraftSurvived}
     />
   ) : null
 
