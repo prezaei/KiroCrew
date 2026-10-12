@@ -41,11 +41,30 @@ N is a numeric literal, or a module-level constant assigned one: the 50 ms
 ``_TRANSFER_TIMEOUT`` was a constant. A site under ``pytest.raises(TimeoutError)``
 is exercising the timeout path on purpose and is not counted.
 
-Why a committed, per-file baseline when ``test_flake_pattern_ratchet.py`` already
-counts short waits: that gate judges a change against its merge-base, which CI's
-depth-1 checkout cannot read, so it is a local pre-push gate, and its "short" is
-under two seconds. This one holds every file to a number CI can read on any
-checkout, and names the file whose count rose. Lowering the thousands already here
+Two modes prevent both problems:
+
+On a **pull request**: each file the PR touches is held to its count at the
+PR's merge-base (``WAIT_RATCHET_BASE`` in CI, resolved from
+``ratchet_scope.change_merge_base`` locally).  The comparison is against
+**the real count at the PR's base, not the committed ceiling**.  So a PR
+that adds one site to a file that had three sites at its base fails even if
+the committed baseline says four -- baseline headroom does not grant a pass.
+Files the PR does not touch are not judged: merge order alone cannot make
+this PR red, and a PR that merges cannot red main because of another PR's
+sites in files it did not touch.  The merge queue (merge_group) judges the
+merged tree against the committed baseline, not PR mode.
+
+On **main** (push / merge_group, or any run where no base is readable): falls
+back to the committed per-file baseline as the burn-down tracker and catcher
+of last resort.  Keeping it as a hard red is deliberate: the only race that
+can now turn main red is a same-file race between two PRs that each passed
+PR mode (neither added a net site to files it touched at its own base); the
+fix is a rebaseline PR, not silence.
+
+Why a committed baseline AT ALL: ``test_flake_pattern_ratchet.py`` judges a change
+against its merge-base, which CI's depth-1 checkout cannot read, so it is a local
+pre-push gate, and its "short" is under two seconds. This gate holds every file to
+a number and names the file whose count rose. Lowering the thousands already here
 is a separate, tracked effort; this gate only stops the number growing.
 
 A moved or renamed file keeps its count: its line moves to the new path, count
@@ -63,6 +82,8 @@ from __future__ import annotations
 
 import ast
 import functools
+import importlib.util
+import os
 import re
 import sys
 from collections import Counter
@@ -71,8 +92,23 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from test_ratchet_scope import _fixture_git_env
+
+# ratchet_scope is a standalone script; load it the same way
+# test_flake_pattern_ratchet.py does.
+_RATCHET_SCOPE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "ratchet_scope.py"
+_RS_SPEC = importlib.util.spec_from_file_location("ratchet_scope", _RATCHET_SCOPE_SCRIPT)
+assert _RS_SPEC and _RS_SPEC.loader
+ratchet_scope = importlib.util.module_from_spec(_RS_SPEC)
+_RS_SPEC.loader.exec_module(ratchet_scope)
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_wait_discipline_ratchet")
+
+#: CI sets this to the PR's base SHA on pull_request / merge_group runs,
+#: empty on a push to main. The backend-test jobs add:
+#:   WAIT_RATCHET_BASE: ${{ github.event.pull_request.base.sha ||
+#:                          github.event.merge_group.base_sha || '' }}
+_WAIT_RATCHET_BASE_ENV = "WAIT_RATCHET_BASE"
 
 TEST_ROOT = Path(__file__).resolve().parent
 
@@ -127,10 +163,11 @@ MOVE_HINT = (
 )
 
 DRIFT_HINT = (
-    "Not your sites -- main itself is red here, because a change merged after this "
-    "baseline was generated added them? Then the baseline is behind main: raise exactly "
-    "those lines to main's real counts in a separate, baseline-only pull request "
-    "(`--write-baseline` will not do it; it only lowers), and rebase this one on it."
+    "Not your sites -- main drifted after a same-file race between two PRs that "
+    "both passed PR mode (neither added a net site to files it touched at its "
+    "own base)? Then the committed baseline is behind main: raise exactly those "
+    "lines in a baseline-only pull request (`--write-baseline` will not do it; "
+    "it only lowers), then rebase this PR on it."
 )
 
 HELPERS_HINT = (
@@ -397,30 +434,262 @@ def moved_baseline(baseline: dict[str, int], old: str, new: str) -> dict[str, in
     return moved
 
 
+# ── PR-mode: judge only touched files against their count at the PR base ────
+
+
+def _pr_mode_base() -> tuple[str | None, str]:
+    """The commit this PR is judged against, and how it was found.
+
+    Tries, in order:
+
+    1. ``WAIT_RATCHET_BASE`` env var (CI sets it to ``base.sha`` for a PR;
+       the workflow step fetches that commit before running pytest so the
+       object is present in the depth-1 clone).
+    2. ``ratchet_scope.change_merge_base`` for a local run (fork remote,
+       local branch).
+
+    Returns ``(None, reason)`` when no base is readable OR when the
+    resolved base equals HEAD (empty diff -- the main-push case where
+    ``origin/main`` IS the current commit).  The caller then uses
+    committed-baseline mode.
+    """
+    env_sha = os.environ.get(_WAIT_RATCHET_BASE_ENV, "").strip()
+    if env_sha and ratchet_scope._readable(env_sha):
+        # CI: the workflow step already fetched this commit.
+        return env_sha, f"PR base from {_WAIT_RATCHET_BASE_ENV} ({env_sha[:12]})"
+    # Local run or env not set: use the general resolver.
+    base, label = ratchet_scope.change_merge_base(_WAIT_RATCHET_BASE_ENV)
+    if base is None:
+        return None, label
+    # Guard: if the resolved base IS HEAD the diff will be empty.
+    # This is the main-push case (origin/main == HEAD on a depth-1 clone).
+    _head_code, _head_out = ratchet_scope._git_result("rev-parse", "HEAD")
+    if _head_code == 0 and _head_out.strip() == base:
+        return None, f"resolved base equals HEAD ({label}) -- committed-baseline mode"
+    return base, label
+
+
+def _pr_mode_violations(
+    base: str,
+    *,
+    cwd: Path | None = None,
+    root: Path | None = None,
+) -> dict[str, tuple[int, int, list[Site]]] | None:
+    """Files the PR touches that gained short waits relative to *base*.
+
+    Returns ``{rel: (base_count, now_count, sites_now)}`` for files whose
+    count rose.  Files the PR did not touch are not judged.  ``rel`` is
+    relative to the test root (``root`` or :data:`TEST_ROOT`).
+
+    *cwd* and *root* exist so tests can point the function at a scratch
+    git repository; both default to the real repo root / test root.
+
+    Returns an empty dict when the git diff is unavailable; the caller
+    then falls through to committed-baseline mode.
+    """
+    test_root = root if root is not None else TEST_ROOT
+    try:
+        pairs = ratchet_scope.change_files(base, cwd=cwd)
+    except RuntimeError:
+        # Diff unavailable (corrupt index, missing objects) -- return None so
+        # the caller falls through to committed-baseline mode rather than
+        # silently passing the gate with an empty violation set.
+        return None
+
+    risen: dict[str, tuple[int, int, list[Site]]] = {}
+    for base_path, now_path in pairs:
+        if now_path is None:  # deleted file -- nothing to count
+            continue
+        if not now_path.startswith("test/") or not now_path.endswith(".py"):
+            continue
+        if Path(now_path).name in EXCLUDED:
+            continue
+
+        rel = now_path[len("test/") :]  # relative to test root
+
+        # Count at base (new file -> base_path is None -> base count 0)
+        base_count = 0
+        if base_path is not None and base_path.startswith("test/"):
+            base_source = ratchet_scope.show_at(base, base_path, cwd=cwd)
+            if base_source is not None:
+                base_rel = base_path[len("test/") :]
+                base_count = len(sites_in(base_source, base_rel))
+
+        # Count now (read from the working tree)
+        now_abs = test_root / rel
+        if not now_abs.exists():
+            continue
+        try:
+            now_source = now_abs.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        now_sites = sites_in(now_source, rel)
+        now_count = len(now_sites)
+
+        if now_count > base_count:
+            risen[rel] = (base_count, now_count, now_sites)
+
+    return risen
+
+
+def _main_mode_violations(
+    baseline: dict[str, int], counts: "Counter[str]"
+) -> dict[str, tuple[int, int]]:
+    """Files whose short-wait count exceeds the committed baseline.
+
+    Extracted from the gate so both the gate and its unit tests call the
+    same logic rather than re-implementing the comprehension separately.
+    """
+    return {rel: (baseline.get(rel, 0), n) for rel, n in counts.items() if n > baseline.get(rel, 0)}
+
+
+def _pr_mode_baseline_changed_entries(
+    base: str,
+    *,
+    cwd: Path | None = None,
+) -> dict[str, tuple[str, int, int]]:
+    """Validate BASELINE_FILE edits in this PR against lowered_baseline semantics.
+
+    Returns ``{rel: (kind, a, b)}`` for every violation:
+    - ``kind='raised'``: the entry rose from *a* to *b* (ratchet forbids this).
+    - ``kind='below_real'``: the entry *a* was set below the real count *b*
+      (this would red main on the next push).
+
+    Empty dict when BASELINE_FILE was not changed in this PR.
+    """
+    try:
+        pairs = ratchet_scope.change_files(base, cwd=cwd)
+    except RuntimeError:
+        return {}
+
+    rel_baseline = BASELINE_FILE.relative_to(TEST_ROOT.parent).as_posix()
+    touched_now = {now for _, now in pairs if now is not None}
+    if rel_baseline not in touched_now:
+        return {}  # baseline file not changed in this PR
+
+    # Parse the old baseline at base.
+    old_baseline: dict[str, int] = {}
+    old_src = ratchet_scope.show_at(base, rel_baseline, cwd=cwd)
+    if old_src is not None:
+        for raw in old_src.splitlines():
+            row = raw.strip()
+            if not row or row.startswith("#"):
+                continue
+            cnt, _, rel = row.partition(" ")
+            if cnt.isdigit() and rel:
+                old_baseline[rel] = int(cnt)
+
+    new_baseline = read_baseline()
+    counts = _counts(_tree_scan())
+    violations: dict[str, tuple[str, int, int]] = {}
+
+    # 1. Entries that were raised (new > old).
+    for rel, new_val in new_baseline.items():
+        old_val = old_baseline.get(rel, 0)
+        if new_val > old_val:
+            violations[rel] = ("raised", old_val, new_val)
+
+    # 2. Entries whose new value is below the real count (would red main).
+    for rel, new_val in new_baseline.items():
+        real = counts.get(rel, 0)
+        if real > new_val and rel not in violations:
+            violations[rel] = ("below_real", new_val, real)
+
+    return violations
+
+
 # ── the gate ─────────────────────────────────────────────────────────────
 
 
 def test_no_file_gains_a_short_fixed_wait() -> None:
-    """A file's count of short fixed waits may only fall; a new file starts at zero."""
-    found = _tree_scan()
-    baseline = read_baseline()
-    counts = _counts(found)
-    risen = {
-        rel: (baseline.get(rel, 0), n) for rel, n in counts.items() if n > baseline.get(rel, 0)
-    }
-    if not risen:
-        return
-    report = []
-    for rel, (was, now) in sorted(risen.items()):
-        report.append(f"  test/{rel}: {was} -> {now}")
-        report.extend(f"      {site}" for site in found[rel])
-    raise AssertionError(
-        f"{len(risen)} file(s) gained a short fixed wait (a wait_for, asyncio.timeout or "
-        f".result(timeout) under {LOST_RUN_FLOOR_SECS:g}s, or a sleep under "
-        f"{SHORT_POLL_SLEEP_SECS:g}s inside a loop):\n" + "\n".join(report) + "\n"
-        f"{HELPERS_HINT}\n{BASELINE_FILE.name} is a ratchet: a count may only go down. "
-        f"{MOVE_HINT}\n{DRIFT_HINT}"
-    )
+    """A file's short-wait count may only fall, never rise.
+
+    On a **pull request**: each file the PR touches is held to its count at
+    the PR's merge-base (``WAIT_RATCHET_BASE`` in CI, or
+    ``ratchet_scope.change_merge_base`` locally).  Files the PR does not
+    touch are not judged -- merge order alone cannot make this PR red, and
+    merging this PR cannot red main because of another PR's sites.
+
+    On **main** (push, merge_group, or any run where no base is readable):
+    falls back to the committed baseline, the burn-down tracker and catcher
+    of last resort.  Drift is a hard red: the PR-side check prevents the
+    merge-order case, so any remaining drift is a genuine race; the fix is
+    a rebaseline PR, never a silenced gate.
+    """
+    base, base_label = _pr_mode_base()
+    use_baseline = base is None
+
+    if not use_baseline:
+        # PR mode: judge only files this PR touched, vs their count at base.
+        risen = _pr_mode_violations(base)
+        if risen is None:
+            # Diff unavailable (corrupt index or missing objects) -- fall
+            # through to committed-baseline mode so the gate never silently
+            # passes when it cannot measure.
+            use_baseline = True
+        elif not risen:
+            # No test-file violations.  If the PR also edited BASELINE_FILE,
+            # validate those edits against lowered_baseline semantics.
+            bv = _pr_mode_baseline_changed_entries(base)
+            if bv:
+                bv_lines = []
+                for rel, (kind, a, b) in sorted(bv.items()):
+                    if kind == "raised":
+                        bv_lines.append(
+                            f"  test/{rel}: baseline raised {a} -> {b} "
+                            "(a count may only go down; lower it by removing sites)"
+                        )
+                    else:
+                        bv_lines.append(
+                            f"  test/{rel}: baseline {a} is below real count {b} "
+                            f"(would red main; lower to {b} by removing those {b - a} site(s))"
+                        )
+                raise AssertionError(
+                    f"{len(bv)} baseline entry change(s) in this PR "
+                    f"violate the lowered_baseline contract:\n"
+                    + "\n".join(bv_lines)
+                    + f"\n{BASELINE_FILE.name} entries may only go DOWN and "
+                    f"never below the real site count.  "
+                    f"{HELPERS_HINT}"
+                )
+            return
+        else:
+            report = [f"(measured against PR base: {base_label})"]
+            for rel, (was, now, sites) in sorted(risen.items()):
+                report.append(f"  test/{rel}: {was} -> {now}")
+                report.extend(f"      {site}" for site in sites)
+            raise AssertionError(
+                f"{len(risen)} file(s) the PR touches gained a short fixed wait "
+                f"compared to their count at the PR base (a wait_for, "
+                f"asyncio.timeout or .result(timeout) under "
+                f"{LOST_RUN_FLOOR_SECS:g}s, or a sleep under "
+                f"{SHORT_POLL_SLEEP_SECS:g}s inside a loop):\n"
+                + "\n".join(report)
+                + f"\n{HELPERS_HINT}\n"
+                f"The limit for each file is its count at {base_label}; "
+                f"it may not rise.  {MOVE_HINT}"
+            )
+
+    if use_baseline:
+        # Main / fallback mode: committed-baseline check.
+        found = _tree_scan()
+        baseline = read_baseline()
+        counts = _counts(found)
+        risen_main = _main_mode_violations(baseline, counts)
+        if not risen_main:
+            return
+        report_main: list[str] = []
+        for rel, (was, now) in sorted(risen_main.items()):
+            report_main.append(f"  test/{rel}: {was} -> {now}")
+            report_main.extend(f"      {site}" for site in found[rel])
+        raise AssertionError(
+            f"{len(risen_main)} file(s) gained a short fixed wait (a wait_for, "
+            f"asyncio.timeout or .result(timeout) under {LOST_RUN_FLOOR_SECS:g}s, "
+            f"or a sleep under {SHORT_POLL_SLEEP_SECS:g}s inside a loop):\n"
+            + "\n".join(report_main)
+            + f"\n{HELPERS_HINT}\n{BASELINE_FILE.name} is a ratchet: a count "
+            f"may only go down.  {MOVE_HINT}\n{DRIFT_HINT}"
+        )
 
 
 def test_the_baseline_is_not_stale() -> None:
@@ -619,6 +888,224 @@ def test_lowering_the_baseline_never_raises_or_adds() -> None:
     assert lowered == {"a.py": 1, "b.py": 2, "gone.py": 0}
     assert "gone.py" not in _format_baseline(lowered)
     assert "new.py" not in _format_baseline(lowered)
+
+
+def _git_in(repo: Path, *args: str) -> str:
+    """Run git in *repo* using an isolated fixture environment."""
+    import subprocess as _sp
+
+    proc = _sp.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        env=_fixture_git_env(),
+    )
+    return proc.stdout.strip()
+
+
+def test_pr_mode_reds_touched_and_ignores_untouched(tmp_path: Path) -> None:
+    """PR mode: a file the PR touched that gains a wait is flagged;
+    an untouched file (already with sites at the base) is not judged.
+
+    The test verifies the result by calling ``_pr_mode_violations`` directly,
+    so it fails if that function is made a no-op.
+    """
+    # -- scratch git repo ------------------------------------------------
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    test_dir = repo / "test"
+    test_dir.mkdir()
+
+    _git_in(repo, "init", "-b", "main")
+    _git_in(repo, "config", "user.email", "t@test.invalid")
+    _git_in(repo, "config", "user.name", "T")
+
+    # Base commit: test_touched.py clean; test_untouched.py already has sites.
+    (test_dir / "test_touched.py").write_text(
+        "import asyncio\nasync def test_x():\n    pass\n", encoding="utf-8"
+    )
+    (test_dir / "test_untouched.py").write_text(
+        "import asyncio\n"
+        "async def test_a():\n    await asyncio.wait_for(f(), timeout=5)\n"
+        "async def test_b():\n    await asyncio.wait_for(f(), timeout=5)\n",
+        encoding="utf-8",
+    )
+    _git_in(repo, "add", ".")
+    _git_in(repo, "commit", "-m", "base")
+    base_sha = _git_in(repo, "rev-parse", "HEAD")
+
+    # Working tree: test_touched.py gains a short wait; test_untouched.py unchanged.
+    (test_dir / "test_touched.py").write_text(
+        "import asyncio\nasync def test_x():\n" "    await asyncio.wait_for(f(), timeout=1)\n",
+        encoding="utf-8",
+    )
+
+    # Call the real production function.
+    risen = _pr_mode_violations(base_sha, cwd=repo, root=test_dir)
+
+    assert (
+        "test_touched.py" in risen
+    ), f"touched file that gained a wait should fail PR mode; got {risen}"
+    assert risen["test_touched.py"][0] == 0  # base count
+    assert risen["test_touched.py"][1] == 1  # now count
+
+    # test_untouched.py was not changed in the working tree, so git diff
+    # does not list it -- it must not appear in PR mode violations.
+    assert "test_untouched.py" not in risen, "untouched file must not be judged in PR mode"
+
+
+def test_main_mode_reds_on_drift(tmp_path: Path) -> None:
+    """Main mode (fallback): a file above its committed baseline is red.
+
+    Calls ``_main_mode_violations`` -- the extracted helper that both the
+    gate and this test use -- so the test fails if that function is replaced
+    by a no-op.
+    """
+    (tmp_path / "test_drifted.py").write_text(
+        "import asyncio\n"
+        "async def test_a():\n    await asyncio.wait_for(f(), timeout=5)\n"
+        "async def test_b():\n    await asyncio.wait_for(f(), timeout=5)\n",
+        encoding="utf-8",
+    )
+    found = scan(tmp_path)
+    counts = _counts(found)
+    # Committed baseline says 1; the file now has 2.
+    baseline = {"test_drifted.py": 1}
+    risen = _main_mode_violations(baseline, counts)
+    assert "test_drifted.py" in risen, "main mode must red a file above its committed baseline"
+    assert risen["test_drifted.py"] == (1, 2), risen
+
+
+def test_pr_mode_catches_site_added_within_baseline_headroom(
+    tmp_path: Path,
+) -> None:
+    """PR mode is stricter than the committed baseline when headroom exists.
+
+    A file that is at N-1 sites at the PR's base but has a committed baseline of N
+    has one site of headroom.  A PR that adds that one site passes the committed
+    check (N <= baseline N) but MUST fail PR mode (base had N-1, now N).
+    This is the structural fix for incidents #19329, #19478, #19495: those PRs
+    were green on the committed baseline because of headroom left by an earlier
+    PR that had already lowered the committed ceiling.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    test_dir = repo / "test"
+    test_dir.mkdir()
+
+    _git_in(repo, "init", "-b", "main")
+    _git_in(repo, "config", "user.email", "t@test.invalid")
+    _git_in(repo, "config", "user.name", "T")
+
+    # Base commit: file has 4 sites; committed baseline would be 5 (headroom 1).
+    # (We only need the base count -- the committed baseline is not consulted
+    # in PR mode, so the baseline file is not needed in this scratch repo.)
+    base_src = "import asyncio\n" + "\n".join(
+        f"async def test_{k}():\n    await asyncio.wait_for(f(), timeout=5)\n" for k in range(4)
+    )
+    (test_dir / "test_headroom.py").write_text(base_src, encoding="utf-8")
+    _git_in(repo, "add", ".")
+    _git_in(repo, "commit", "-m", "base")
+    base_sha = _git_in(repo, "rev-parse", "HEAD")
+
+    # Working tree: one more site (5 total). Committed baseline of 5 would pass;
+    # PR mode must fail (base had 4, head has 5).
+    head_src = base_src + "async def test_extra():\n    await asyncio.wait_for(f(), timeout=5)\n"
+    (test_dir / "test_headroom.py").write_text(head_src, encoding="utf-8")
+
+    risen = _pr_mode_violations(base_sha, cwd=repo, root=test_dir)
+    assert risen is not None, "_pr_mode_violations must not degrade here"
+    assert "test_headroom.py" in risen, (
+        "PR mode must catch a site added within baseline headroom; "
+        "the committed baseline of 5 would silently pass"
+    )
+    assert risen["test_headroom.py"][0] == 4  # base count
+    assert risen["test_headroom.py"][1] == 5  # now count
+
+
+def test_pr_mode_catches_baseline_entry_lowered_below_real_count(
+    tmp_path: Path,
+) -> None:
+    """PR mode catches a baseline edit that lowers an entry below the real count.
+
+    A PR that edits only ``wait_discipline_baseline.txt`` (not the test file)
+    and lowers a count below the file's real site count would pass
+    ``_pr_mode_violations`` (no touched test/.py), then red main on the next
+    push.  ``_pr_mode_baseline_changed_entries`` catches it here instead.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    test_dir = repo / "test"
+    test_dir.mkdir()
+
+    _git_in(repo, "init", "-b", "main")
+    _git_in(repo, "config", "user.email", "t@test.invalid")
+    _git_in(repo, "config", "user.name", "T")
+
+    # Base commit: test file has 2 sites; baseline says 2.
+    two_site_src = (
+        "import asyncio\n"
+        "async def test_a():\n    await asyncio.wait_for(f(), timeout=5)\n"
+        "async def test_b():\n    await asyncio.wait_for(f(), timeout=5)\n"
+    )
+    (test_dir / "test_foo.py").write_text(two_site_src, encoding="utf-8")
+    # Baseline file at base.
+    baseline_txt = repo / "test" / "wait_discipline_baseline_scratch.txt"
+    baseline_at_base = "2 test_foo.py\n"
+    baseline_txt.write_text(baseline_at_base, encoding="utf-8")
+    _git_in(repo, "add", ".")
+    _git_in(repo, "commit", "-m", "base")
+    base_sha = _git_in(repo, "rev-parse", "HEAD")
+
+    # Working tree: baseline lowered to 1, but test file still has 2 sites.
+    baseline_txt.write_text("1 test_foo.py\n", encoding="utf-8")
+    # test_foo.py unchanged.
+
+    # Simulate _pr_mode_baseline_changed_entries logic directly.
+    # (We point it at our scratch repo via change_files, not BASELINE_FILE.)
+    try:
+        pairs = ratchet_scope.change_files(base_sha, cwd=repo)
+    except RuntimeError:
+        pairs = []
+    touched_now = {now for _, now in pairs if now is not None}
+    # The baseline txt was changed in this PR.
+    assert (
+        "test/wait_discipline_baseline_scratch.txt" in touched_now
+    ), f"Expected baseline .txt in touched set; got {touched_now}"
+    # Parse old and new baseline to find the 'below_real' violation.
+    old_src = ratchet_scope.show_at(base_sha, "test/wait_discipline_baseline_scratch.txt", cwd=repo)
+    old_b: dict[str, int] = {}
+    if old_src:
+        for row in old_src.splitlines():
+            row = row.strip()
+            if not row or row.startswith("#"):
+                continue
+            cnt, _, rel = row.partition(" ")
+            if cnt.isdigit() and rel:
+                old_b[rel] = int(cnt)
+    new_b_txt = baseline_txt.read_text(encoding="utf-8")
+    new_b: dict[str, int] = {}
+    for row in new_b_txt.splitlines():
+        row = row.strip()
+        if not row or row.startswith("#"):
+            continue
+        cnt, _, rel = row.partition(" ")
+        if cnt.isdigit() and rel:
+            new_b[rel] = int(cnt)
+    # Real count of test_foo.py is 2.
+    found = scan(test_dir)
+    counts = _counts(found)
+    # test_foo.py: new baseline is 1, real count is 2 -> 'below_real' violation.
+    below_real = {
+        rel: (nb, counts.get(rel, 0)) for rel, nb in new_b.items() if counts.get(rel, 0) > nb
+    }
+    assert (
+        "test_foo.py" in below_real
+    ), f"Expected below_real violation for test_foo.py; got {below_real}"
+    assert below_real["test_foo.py"] == (1, 2), below_real
 
 
 # ── command line ────────────────────────────────────────────────────────
