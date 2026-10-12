@@ -4280,6 +4280,7 @@ _DASHBOARD_TOOL_CALLS = {
     "session_retry": {"target": "chat-2"},
     "session_set_model": {"target": "chat-2", "model": "sonnet"},
     "session_reload": {"target": "chat-2"},
+    "session_set_autocompact": {"target": "chat-2", "pct": 40},
     "session_rename": {"target": "chat-2", "title": "Worker"},
     "session_close": {"target": "chat-2"},
     "session_revive": {"target": "chat-2"},

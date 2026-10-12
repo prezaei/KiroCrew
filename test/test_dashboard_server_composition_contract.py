@@ -1418,7 +1418,7 @@ _DASHBOARD_BOOT = tuple("""
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
-    register_all subprocess_executor subprocess_executor subprocess_executor
+    _deferred register_all subprocess_executor subprocess_executor subprocess_executor
     subprocess_executor subprocess_executor subprocess_executor _register_deploy_routes
     setup_knowledge_routes setup_weixin_routes setup_feedback_routes
     setup_secrets_routes setup_whatsapp_routes setup_link_meta_routes bind_address_for
@@ -1486,7 +1486,7 @@ _API_BOOT = tuple("""
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
-    _register_deploy_routes _register_stt_hooks _register_own_host_warm
+    _deferred _register_deploy_routes _register_stt_hooks _register_own_host_warm
     _register_config_watch _register_prevent_sleep_shutdown
     _register_listener_guard_shutdown _register_browser_install_cleanup
     _register_connections_warm_lifecycle _register_workflow_lifecycle
@@ -1699,8 +1699,8 @@ def _routes(app: web.Application) -> list[tuple[str, str, str]]:
 #: SHA-256 of the MCP route table's ``"<method> <path> <handler>"`` rows in
 #: registration order, and their count. The table is shared by both entrypoints, so a
 #: route added to it on purpose updates these with it.
-_MCP_TABLE_ROWS = 281
-_MCP_TABLE_DIGEST = "62e2119918cf293bddece697d6e08f5d585e6231765a63e7979a2c2796c808b1"
+_MCP_TABLE_ROWS = 282
+_MCP_TABLE_DIGEST = "8bc5fb1f8ea81a236371f0f86d17b0e201921acf9e6d2d36029ae06dbe138a22"
 
 
 def test_the_mcp_route_table_keeps_its_rows_and_order() -> None:

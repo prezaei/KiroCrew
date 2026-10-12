@@ -4076,6 +4076,16 @@ SESSION_RELOAD_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_SET_AUTOCOMPACT_SCHEMA = ToolSchema(
+    tool_name="session_set_autocompact",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        # Omitted = read, null = clear, a number = set. The range is checked by
+        # the gateway (``parse_autocompact_pct``) so the refusal names the limits.
+        FieldSpec("pct", (int, float)),
+    ],
+)
+
 SESSION_RENAME_SCHEMA = ToolSchema(
     tool_name="session_rename",
     fields=[
@@ -4431,6 +4441,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_retry": SESSION_RETRY_SCHEMA,
     "session_set_model": SESSION_SET_MODEL_SCHEMA,
     "session_reload": SESSION_RELOAD_SCHEMA,
+    "session_set_autocompact": SESSION_SET_AUTOCOMPACT_SCHEMA,
     "session_rename": SESSION_RENAME_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
     "session_revive": SESSION_REVIVE_SCHEMA,
