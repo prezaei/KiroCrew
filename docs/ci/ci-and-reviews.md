@@ -762,6 +762,17 @@ Their steps, permissions and triggers are unchanged.
 Sensitive Change Review uses the fleet on every PR and review event, not just
 `opened`/`synchronize`: it checks out only default-branch scripts and runs no
 PR code, so the "actor did not supply the code" reason does not apply.
+PR Readiness uses the same reasoning on its `pull_request_target` and
+`workflow_run` runs, at thousands of runs a day the largest cut in hosted
+queue use. Its fork check reads the head each event names:
+`github.event.pull_request.head.repo.full_name` and
+`github.event.workflow_run.head_repository.full_name`. Its `workflow_dispatch`
+runs stay hosted: that payload names no head, and the sweep dispatches as
+github-actions[bot], which is not listed. So a lost fleet runner never leaves
+the required status unpublished: the hosted sweep recompute still lands. A lost
+`in_progress` hold does leave the old verdict up until that recompute.
+It needs no fleet setup step: the image ships gh, python3 and coreutils, and
+the readiness step tests pass on the image's jq 1.6.
 
 The repository variable is a JSON array of string actor IDs matching the fleet
 webhook filter. The maintainer changing either fleet project's actor filter owns

@@ -209,7 +209,17 @@ jobs:
       github.event_name != 'workflow_run'
       || github.event.workflow_run.event == 'pull_request'
       || github.event.workflow_run.event == 'dynamic'
-    runs-on: ubuntu-latest
+    # This is the busiest workflow here: thousands of ~12-second runs a day, in
+    # bursts. A same-repository PR from a listed actor uses the CodeBuild fleet
+    # so those runs stay out of the shared hosted queue. The job never checks
+    # out or runs PR code (see `on:`), so every PR activity may use it, as for
+    # Sensitive Change Review. The head-repository check is per event:
+    # `pull_request_target` names the PR head, `workflow_run` names the
+    # triggering run's head. A fork stays hosted. `workflow_dispatch` stays
+    # hosted: its payload names no head, so it cannot pass the fork check, and
+    # the sweep's dispatches come from github-actions[bot], which is not
+    # listed. Unset CODEBUILD_ACTOR_IDS to send every new run back to hosted.
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && ((github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'workflow_run' && github.event.workflow_run.head_repository.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       # The same-repo workflow-run lanes of the verdict step's spec list, read
