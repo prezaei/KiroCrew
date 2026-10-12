@@ -1522,6 +1522,22 @@
       "description": "AWS region for Transcribe"
     },
     {
+      "id": "voice.custom-model-file",
+      "label": "Custom model file",
+      "tab": "voice",
+      "route": "/settings/voice?highlight=key%3Astt.custom_model_path",
+      "description": "A wrong name is refused and nothing else changes. Only whisper.cpp .bin model files work.",
+      "configKey": "stt.custom_model_path"
+    },
+    {
+      "id": "voice.custom-model-sha-256",
+      "label": "Custom model SHA-256",
+      "tab": "voice",
+      "route": "/settings/voice?highlight=key%3Astt.custom_model_sha256",
+      "description": "A wrong value is refused and nothing else changes. A fingerprint that proves the file is the one you meant.",
+      "configKey": "stt.custom_model_sha256"
+    },
+    {
       "id": "voice.custom-vocabulary",
       "label": "Custom vocabulary",
       "tab": "voice",

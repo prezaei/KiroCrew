@@ -2538,6 +2538,26 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "voice.custom-model-file",
+    "label": "Custom model file",
+    "labelKey": "pages.settings.sttSettings.custom_model_path",
+    "description": "A wrong name is refused and nothing else changes. Only whisper.cpp .bin model files work.",
+    "tab": "voice",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "stt.custom_model_path"
+  },
+  {
+    "id": "voice.custom-model-sha-256",
+    "label": "Custom model SHA-256",
+    "labelKey": "pages.settings.sttSettings.custom_model_sha256",
+    "description": "A wrong value is refused and nothing else changes. A fingerprint that proves the file is the one you meant.",
+    "tab": "voice",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "stt.custom_model_sha256"
+  },
+  {
     "id": "voice.custom-vocabulary",
     "label": "Custom vocabulary",
     "labelKey": "pages.settings.sttSettings.transcribe_vocabulary",
