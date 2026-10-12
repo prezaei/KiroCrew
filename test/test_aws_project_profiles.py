@@ -129,9 +129,23 @@ class TestBoundProfileEnv:
         proj = _project(tmp_path, "proj")
         caller = {"FOO": "bar"}
         result = app.bound_profile_env({str(proj): "dev"}, str(proj), caller)
-        assert result == {"FOO": "bar", "AWS_PROFILE": "dev"}
+        assert result == {"FOO": "bar", "AWS_PROFILE": "dev", "AWS_DEFAULT_PROFILE": "dev"}
         assert caller == {"FOO": "bar"}
-        assert app.bound_profile_env({str(proj): "dev"}, str(proj), None) == {"AWS_PROFILE": "dev"}
+        assert app.bound_profile_env({str(proj): "dev"}, str(proj), None) == {
+            "AWS_PROFILE": "dev",
+            "AWS_DEFAULT_PROFILE": "dev",
+        }
+
+    @pytest.mark.parametrize("name", ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"])
+    def test_a_selector_the_gateway_inherited_cannot_outrank_the_binding(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        """The launcher layers ``extra_env`` over the gateway's own environment."""
+        proj = _project(tmp_path, "proj")
+        overlay = app.bound_profile_env({str(proj): "dev"}, str(proj), None)
+        child_env = {name: "prod", **(overlay or {})}
+        assert child_env["AWS_PROFILE"] == "dev"
+        assert child_env["AWS_DEFAULT_PROFILE"] == "dev"
 
     @pytest.mark.parametrize("name", ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"])
     def test_a_profile_the_caller_chose_wins(self, tmp_path: Path, name: str) -> None:
@@ -174,7 +188,10 @@ class TestNoFileIsRead:
 
         assert unbound is None, "a repo file must never bind a profile"
         assert elsewhere is None
-        assert bound == {"AWS_PROFILE": "dev"}, "only the operator's map binds"
+        assert bound == {
+            "AWS_PROFILE": "dev",
+            "AWS_DEFAULT_PROFILE": "dev",
+        }, "only the operator's map binds"
 
 
 class TestCoerce:
@@ -413,7 +430,11 @@ class TestSessionSpawn:
             await mgr.get_or_create("chat-6332", cwd=str(proj / "src"), extra_env=caller)
         finally:
             await mgr.close_all()
-        assert calls[0]["extra_env"] == {"FOO": "bar", "AWS_PROFILE": "dev"}
+        assert calls[0]["extra_env"] == {
+            "FOO": "bar",
+            "AWS_PROFILE": "dev",
+            "AWS_DEFAULT_PROFILE": "dev",
+        }
         assert caller == {"FOO": "bar"}
 
     @pytest.mark.asyncio
@@ -432,7 +453,10 @@ class TestSessionSpawn:
                 await mgr.get_or_create("chat-6332", cwd=str(proj))
         finally:
             await mgr.close_all()
-        assert calls[0]["extra_env"] == {"AWS_PROFILE": "zq-acct-7"}
+        assert calls[0]["extra_env"] == {
+            "AWS_PROFILE": "zq-acct-7",
+            "AWS_DEFAULT_PROFILE": "zq-acct-7",
+        }
         elsewhere = [k for k, v in calls[0].items() if k != "extra_env" and "zq-acct-7" in repr(v)]
         assert elsewhere == [], "the profile name travels only as the AWS_PROFILE value"
         applied = [r.getMessage() for r in caplog.records if "zq-acct-7" in r.getMessage()]
@@ -493,7 +517,7 @@ class TestSessionSpawn:
             await mgr.close_all()
         mgr._drain_and_claim.assert_not_awaited()
         assert decisions == ["bypass_env"]
-        assert calls[0]["extra_env"] == {"AWS_PROFILE": "dev"}
+        assert calls[0]["extra_env"] == {"AWS_PROFILE": "dev", "AWS_DEFAULT_PROFILE": "dev"}
 
 
 class TestTaskRunStep:
@@ -550,3 +574,29 @@ class TestTaskRunStep:
                 )
         finally:
             await mgr.close_all()
+
+
+class TestHotReload:
+    @pytest.mark.asyncio
+    async def test_a_binding_change_reaches_the_next_spawn_without_a_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """The manager subscribes to ``aws``, so an edit alone is adopted into ``_cfg``."""
+        from kiro_crew.config.live import ConfigChange
+        from kiro_crew.session import SessionManager
+
+        proj = _project(tmp_path, "proj")
+        calls: list[dict] = []
+        mgr = SessionManager(_cfg({}), provider_factory=_recording_factory(calls))
+        mgr.refresh_defaults = AsyncMock()  # type: ignore[method-assign]
+        try:
+            assert "aws" in mgr._config_sub.prefixes
+            edited = _cfg({str(proj): "dev"})
+            await mgr._on_config_change(
+                ConfigChange(old=None, new=edited, changed=frozenset({"aws.project_profiles"}))
+            )
+            mgr.refresh_defaults.assert_not_awaited()
+            await mgr.get_or_create("chat-6332", cwd=str(proj))
+        finally:
+            await mgr.close_all()
+        assert calls[0]["extra_env"] == {"AWS_PROFILE": "dev", "AWS_DEFAULT_PROFILE": "dev"}

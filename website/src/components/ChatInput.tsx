@@ -6,6 +6,7 @@ import { ArrowUp, Loader2, RotateCw, Sparkles, Target, CheckCircle, Lock, Folder
 import SketchDialog from './SketchDialog'
 import QuoteCard from '../pages/chat/QuoteCard'
 import CopyBranchButton from './CopyBranchButton'
+import ProjectAwsProfileStatus from './ProjectAwsProfile'
 import RejectDropdown from './RejectDropdown'
 import { createPortal } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -1414,6 +1415,7 @@ function ChatInput({
               />
             </>
           )}
+          {!!project && <ProjectAwsProfileStatus project={project} shelfCompact={shelfCompact} />}
           </div>
           )}
           </div>

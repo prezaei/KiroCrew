@@ -2144,6 +2144,8 @@ class SessionManager:
         "agents",
         "workspaces",
         "default_workspace",
+        # aws.project_profiles is read off ``_cfg`` at each spawn.
+        "aws",
     )
     _FACTORY_CONFIG_PATHS: tuple[str, ...] = (
         "agent.model",

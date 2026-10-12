@@ -461,6 +461,60 @@ Both local defaults (`system` for TTS, `local` for STT) need no AWS account and 
 confirmation. `system` additionally needs nothing installed on macOS and Windows,
 which is why it is the TTS default rather than `piper`.
 
+### An AWS profile per project
+
+`aws.project_profiles` binds an AWS named profile to a project directory. A
+session working in that directory starts its agent with `AWS_PROFILE` (and
+`AWS_DEFAULT_PROFILE`, which some tools read first) set to the profile, so `aws`,
+the SDKs and tools built on them reach that account without a `--profile` on every
+command. It works with any profile in your own AWS config:
+IAM keys, SSO or `credential_process`.
+
+Set it from the chat composer: click the project folder in the project pill, and
+the project picker carries an **AWS profile for this project** row once you have
+AWS profiles registered in AWS Control or the project is bound. Pick a profile,
+type another name in **Other profile name** and click **Use profile**, or pick
+**No profile** to go back to the gateway's own AWS sign-in. The pill itself then
+shows the bound profile. You can also edit the map directly:
+
+```bash
+kirocrew config set aws.project_profiles '{"/home/me/src/billing": "billing-prod", "/home/me/src/sandbox": "dev"}'
+```
+
+How a session's directory is matched:
+
+- **The deepest mapped directory wins.** A key covers the directory itself and
+  everything under it, so `/home/me/src` and `/home/me/src/billing` can both be
+  bound and `billing` gets its own profile.
+- **Matching is on whole path components after resolving symlinks.**
+  `/a/proj` does not cover `/a/project2`, and a symlink counts as the
+  directory it points to.
+- **An unmapped directory keeps today's behaviour:** the agent gets whatever
+  credential chain the gateway itself has.
+- **A profile the caller sets itself wins**, for example a scheduled job's
+  `env` with its own `AWS_PROFILE` or `AWS_DEFAULT_PROFILE`.
+- **A change reaches sessions started after it.** A session that is already
+  running keeps the environment it started with.
+
+When a bound profile's sign-in no longer works, the profile in the pill turns amber.
+For an SSO profile its tooltip gives the `aws sso login --profile <name>` command to
+run.
+
+A profile name must be 1 to 128 letters, digits, `_`, `.`, `+` or `-`, and must not
+start with `-`. A bad name or a relative directory is refused when you save it, and
+ignored with a warning if a hand edit puts it in `config.json`.
+
+The binding is a default, not a boundary. Only the profile **name** is stored and
+passed on, and no credential is read or copied. The agent can still name another
+profile. The binding is read only from your own `config.json`, never from a file
+inside the project, so a cloned repository cannot choose which account its agent
+uses. For separation beyond picking the account:
+
+- A [crew](crew-members.md) gives a project its own workspace, memory store and
+  approval mode.
+- A separate Kiro Crew instance, with its own `KIROCREW_HOME` and port, keeps
+  everything apart.
+
 ### Memory and embeddings
 
 Embeddings are always on and run in-process through the bundled
