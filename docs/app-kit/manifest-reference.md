@@ -145,6 +145,24 @@ and self-registration refuse a manifest without it, with an error that names the
 fix. An app installed before it declared the grant keeps loading and firing its
 crons; it meets the rule on its next update.
 
+**Changing a cron after install.** Each registered job remembers the manifest
+entry it was built from. When the app's crons are registered again -- an app
+update, a gateway start, an enable -- an entry that changed is re-applied to its
+job: every field in the table above except `enabled`, which is the initial pause
+state only. A job whose entry did not change is left exactly as it is, including
+any edit the user made on the Schedule page. The precedence when an entry does
+change is **manifest over hand edit** for those fields, and **the user's pause
+state over the manifest** always: a paused job gets the new values and stays
+paused. Settings the manifest does not own -- a delivery channel, a model, chat
+visibility, a secret grant -- are never touched. A change to `command`, `script`,
+`agent_sequence` or `env` is the exception: the scheduler accepts those fields at
+creation only, so the change is logged (and audited as
+`app_cron_resync_pending_reenable`) on every registration until the app is
+disabled and enabled again, which is when it reaches the job; the entry's other
+changed fields still land at once. A job registered
+by a build that did not yet record its entry is brought up to the manifest once,
+on the next registration.
+
 > **Caveat:** disabling an app deletes its registered cron jobs when a cron
 > service is reachable, and re-enabling the app re-registers them from the
 > manifest. A cron shipped with `"enabled": false` that a user later resumed
