@@ -6353,7 +6353,7 @@ describe('MembersPage warm greeting (a return in the middle of a goal)', () => {
     vi.mocked(api.crewBoard).mockRejectedValue(Object.assign(new Error('ledger needs repair'), { status: 409 }))
     await renderPage([row()])
     fireEvent.click(await rosterRow('oncall'))
-    expect(await screen.findByTestId('member-resume-error', undefined, PANE_READY)).toHaveTextContent("Could not read where oncall's goal stands.")
+    expect(await screen.findByTestId('member-resume-error', undefined, PANE_READY)).toHaveTextContent("Could not read where oncall's task stands.")
     expect(screen.queryByTestId('member-resume-card')).toBeNull()
   })
 
