@@ -14,7 +14,7 @@ import json
 import logging
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +69,83 @@ class _SemanticScoringSet:
     rows: tuple[dict[str, object], ...]
     generation: int
     data_version: int
+    # Query-independent work derived from ``rows`` on first use and kept for the
+    # set's lifetime: the row token sets (keyed on the text itself, so a label
+    # that moves with an identity edit simply misses) and, per query width, the
+    # stored vectors stacked into one matrix with their norms. Both are pure
+    # functions of ``rows``, which is immutable, so nothing invalidates them but
+    # the set being replaced.
+    derived: dict = field(default_factory=dict, compare=False, repr=False)
+
+
+def _scoring_row_tokens(scoring: _SemanticScoringSet):
+    """Row tokenizer memoized for exactly this scoring set's population.
+
+    The module-level LRU cannot serve a scan wider than its bound (it thrashes
+    to a zero hit rate), so a resident set owns its own unbounded memo: it is
+    bounded by the population the set already holds.
+    """
+    memo: dict[str, frozenset[str]] = scoring.derived.setdefault("tokens", {})
+    uncached = _text_scoring._row_stem_tokens_uncached
+
+    def row_tokens(text: str) -> frozenset[str]:
+        tokens = memo.get(text)
+        if tokens is None:
+            tokens = memo[text] = uncached(text)
+        return tokens
+
+    return row_tokens
+
+
+# Rows widened to float64 at a time when scoring against the resident matrix.
+_COSINE_CHUNK_ROWS = 128
+
+
+def _scoring_cosines(scoring: _SemanticScoringSet, query_embedding: list[float] | None):
+    """Cosine of every row against the query, or ``None`` without numpy.
+
+    Bit-identical to ``_stored_similarity_scorer``'s numpy rung: the same
+    float64 1-D dot per row and the same per-row ``np.linalg.norm``, 0.0 for a
+    missing or other-width vector. Only the query-independent part moves: the
+    blobs are stacked once per set and width and their norms computed once. A
+    batched mat-vec would be faster still but sums in a different order, which
+    changes the last bits of every score (measured on a real store: 1,228 cosine
+    and 861 score differences across 1,000 recalls), so it is not used.
+    """
+    from kiro_crew import vector_memory as vm  # circular import: the facade imports this module
+
+    if not vm._HAS_NUMPY or not query_embedding:
+        return None
+    np = vm.np
+    q = np.asarray(query_embedding, dtype=np.float64)
+    q_norm = float(np.linalg.norm(q))
+    sims = [0.0] * len(scoring.rows)
+    if not q_norm:
+        return sims
+    width = len(q)
+    cached = scoring.derived.get(("vectors", width))
+    if cached is None:
+        index: list[int] = []
+        blobs: list[bytes] = []
+        for i, row in enumerate(scoring.rows):
+            blob = row.get("embedding")
+            if isinstance(blob, bytes) and len(blob) == width * 4:
+                index.append(i)
+                blobs.append(blob)
+        matrix = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(len(blobs), width)
+        norms = [
+            float(np.linalg.norm(np.frombuffer(blob, dtype=np.float32).astype(np.float64)))
+            for blob in blobs
+        ]
+        cached = scoring.derived[("vectors", width)] = (index, matrix, norms)
+    index, matrix, norms = cached
+    for start in range(0, len(index), _COSINE_CHUNK_ROWS):
+        wide = matrix[start : start + _COSINE_CHUNK_ROWS].astype(np.float64)
+        for offset, vec in enumerate(wide):
+            row_norm = norms[start + offset]
+            denom = row_norm * q_norm
+            sims[index[start + offset]] = float(vec @ q) / denom if denom else 0.0
+    return sims
 
 
 def _strict_json_equal(a: object, b: object) -> bool:
@@ -778,14 +855,53 @@ def semantic_candidates_v1(
     similarity = store._stored_similarity_scorer(query_embedding)
     query_has_vector = query_embedding is not None
 
+    identities = store._fact_identities()
+    scored_rows: list[tuple[float, dict]] = []
+    if scoring is not None:
+        # Resident set: tokens and vectors are derived once per set, so a warm
+        # query pays one dot and one set intersection per row, and copies
+        # only the rows it returns.
+        row_tokens = _scoring_row_tokens(scoring)
+        cosines = _scoring_cosines(scoring, query_embedding) if query_has_vector else None
+        blocked = store._ineligible_ids()
+        for i, raw in enumerate(all_rows):
+            key = raw["key"]
+            if blocked and record_meta.record_id_for("fact", key) in blocked:
+                continue
+            identity = identities.get(key)
+            label_row = {"key": key, "identity": identity} if identity is not None else raw
+            label = key if identity is None else store._fact_label(label_row)
+            key_words = row_tokens(label.replace("_", " ").replace(".", " "))
+            val_words = row_tokens(raw["value_json"].lower())
+            kw_raw = len(query_words & key_words) * 3 + len(query_words & val_words)
+            kw_score = _text_scoring._keyword_score(kw_raw)
+            if cosines is not None:
+                vec_score = max(0.0, cosines[i])
+            else:
+                vec_score = max(0.0, similarity(raw))
+            score = _text_scoring._hybrid_score(
+                kw_score, vec_score, query_has_vector=query_has_vector
+            )
+            if score > 0:
+                r = dict(raw)
+                if identity is not None:
+                    r["identity"] = identity
+                r["retrieval"] = {
+                    "reason": "v1_hybrid_match",
+                    "score": score,
+                    "matched_terms": sorted(query_words & (key_words | val_words)),
+                    "cosine": vec_score if query_has_vector else None,
+                }
+                scored_rows.append((score, r))
+        scored_rows.sort(key=lambda x: (-x[0], x[1]["updated_at"]))
+        return [r[1] for r in scored_rows]
+
     # Both token sets depend only on the row's own text, so re-deriving
     # them per query is the bulk of a warm call — but only a scan that
     # fits the cache can hit it, so the width decides which form runs.
     # Two entries per row: one for the key, one for the value.
     row_tokens = _text_scoring._row_stem_tokens_for_scan(2 * len(all_rows))
 
-    identities = store._fact_identities()
-    scored_rows: list[tuple[float, dict]] = []
     for raw in store._eligible_rows(all_rows, "fact"):
         r = dict(raw)
         if r["key"] in identities:
