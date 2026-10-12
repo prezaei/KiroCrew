@@ -6122,6 +6122,7 @@
       "done_subject_ended": "Fertig · das beobachtete Objekt endete, ohne abgeschlossen zu werden",
       "clear_finished_goal": "Abgeschlossenes Ziel löschen",
       "pause_loop": "Schleife pausieren",
+      "goal_stale_baseline": "Das Ziel wurde geändert oder neu geladen, seit du dies geöffnet hast. Dein Text bleibt erhalten – speichere erneut, um es zu ersetzen.",
       "resume_loop": "Schleife fortsetzen und jetzt anstoßen",
       "save_edits_and_resume": "Änderungen speichern, Schleife fortsetzen und jetzt anstoßen",
       "loop_paused": "Pausiert",

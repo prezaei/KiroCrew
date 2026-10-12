@@ -6219,6 +6219,7 @@
       "done_subject_ended": "Terminé · le sujet surveillé s’est arrêté sans arriver à son terme",
       "clear_finished_goal": "Supprimer l’objectif terminé",
       "pause_loop": "Suspendre la boucle",
+      "goal_stale_baseline": "L’objectif a été modifié ou rechargé depuis que tu as ouvert ceci. Ton texte est conservé — enregistre à nouveau pour le remplacer.",
       "resume_loop": "Reprendre la boucle et relancer maintenant",
       "save_edits_and_resume": "Enregistrer les modifications, reprendre la boucle et relancer maintenant",
       "loop_paused": "En pause",
