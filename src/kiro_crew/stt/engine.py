@@ -1022,6 +1022,12 @@ class WhisperEngine:
                 self._last_used = time.monotonic()
                 self._warmed_key = self._key
                 complete = True
+                if kind != telemetry.KIND_PREWARM and models.claim_usage_stamp():
+                    # Read by the boot prewarm gate (stt_hooks): a host that never
+                    # decodes does not pay for resident weights on every launch.
+                    # The claim is a clock read; the write is file I/O, so it runs
+                    # off the loop, and only once an hour per process.
+                    await asyncio.to_thread(models.write_usage_marker)
                 if should_abort():
                     return ""
                 # Only after the abort check: an aborted decode unwinds early, and its
