@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next'
-import { useQueryClient } from '@tanstack/react-query'
-import { FileText, ExternalLink, TerminalSquare, MoreHorizontal } from 'lucide-react'
+import { useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { FileText, ExternalLink, TerminalSquare, MoreHorizontal, AppWindow } from 'lucide-react'
 import { useBranding } from '../../hooks/useBranding'
 import { revealOrOpen, useRevealFailure, useRevealLabel } from '../../components/FilePathMenu'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -11,6 +12,8 @@ import FileBrowserRail, { useTreeState, useTreeQuery } from './FileBrowserRail'
 import { searchErrorCause, TREE_FAILURE_KEYS } from '../../lib/searchErrorCause'
 import { reportForError } from '../../utils/errorReport'
 import { pathBasename, stripTrailingSeparators } from '../../utils/pathBasename'
+import { api } from '../../api/client'
+import { canOpenExternalTerminal, detectExternalTerminals, openInExternalTerminal } from '../../lib/externalTerminal'
 
 /** Last path segment, trailing slashes ignored. */
 function basename(p: string): string {
@@ -72,6 +75,47 @@ export default function FilesHomePanel({ projectDir, onFileOpen, onAddToContext,
   // query, so this is a second observer on the one request, not a second request.
   const { error: treeErr } = useTreeQuery(projectDir)
   const treeAvailable = treeState === 'ready'
+  // "Open in external terminal": the user's own terminal app, beside the
+  // integrated one and never in its place. Offered only in the desktop shell
+  // (the only place with a launch bridge), against a gateway on this machine,
+  // and once an app is picked in Settings (`dashboard.terminal.external_app`,
+  // unset by default). Hiding the row is a convenience, not the gate: the
+  // gateway refuses the launch itself unless the same conditions hold. The
+  // config read is skipped where the row could never show.
+  const externalCapable = isLocal && canOpenExternalTerminal()
+  const externalWanted = externalCapable && !!onOpenTerminal
+  const { data: kcCfg } = useQuery<{ dashboard?: { terminal?: { external_app?: unknown } } }>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+    enabled: externalWanted,
+  })
+  // The installed apps as the desktop shell detects them: the row names the
+  // picked app by its display label, and a pick that is no longer installed
+  // shows no row (the Settings picker shows it as None), since its launch
+  // could only fail.
+  const { data: externalApps } = useQuery({
+    queryKey: ['externalTerminalApps'],
+    queryFn: detectExternalTerminals,
+    enabled: externalWanted,
+  })
+  const pickedApp = kcCfg?.dashboard?.terminal?.external_app
+  const pickedLabel = typeof pickedApp === 'string' && pickedApp !== ''
+    ? externalApps?.find(a => a.id === pickedApp)?.label
+    : undefined
+  const showExternal = externalCapable && !!pickedLabel
+  // A refused or failed launch opens the integrated terminal instead, and says
+  // so, rather than leaving a click that did nothing. The note names the app
+  // that did not open.
+  const [externalFellBack, setExternalFellBack] = useState<string | null>(null)
+  const openExternal = () => {
+    const app = pickedLabel
+    setExternalFellBack(null)
+    void openInExternalTerminal(projectDir).then(result => {
+      if (result.ok) return
+      setExternalFellBack(app ?? '')
+      onOpenTerminal?.()
+    })
+  }
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ['project-tree', projectDir] })
     qc.invalidateQueries({ queryKey: ['git-status', projectDir] })
@@ -127,6 +171,15 @@ export default function FilesHomePanel({ projectDir, onFileOpen, onAddToContext,
                       <span className="text-[11px] text-muted leading-snug">{t('pages.chat.filesHome.open_terminal_hint')}</span>
                     </span>
                   </DropdownMenuItem>
+                  {showExternal && (
+                    <DropdownMenuItem className="items-start" onSelect={openExternal}>
+                      <AppWindow size={13} className="shrink-0 mt-0.5" />
+                      <span className="flex flex-col gap-0.5">
+                        <span>{t('pages.chat.filesHome.open_external_terminal', { app: pickedLabel })}</span>
+                        <span className="text-[11px] text-muted leading-snug">{t('pages.chat.filesHome.open_external_terminal_hint')}</span>
+                      </span>
+                    </DropdownMenuItem>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
@@ -136,6 +189,17 @@ export default function FilesHomePanel({ projectDir, onFileOpen, onAddToContext,
       {reveal.error && (
         <div className="px-3 py-2 border-b border-border">
           <ErrorNotice variant="inline" className="whitespace-normal" message={reveal.error} askAgent onDismiss={reveal.clear} testId="files-home-reveal-error" />
+        </div>
+      )}
+      {externalFellBack !== null && (
+        <div className="px-3 py-2 border-b border-border">
+          <ErrorNotice
+            variant="inline"
+            className="whitespace-normal"
+            message={t('pages.chat.filesHome.external_terminal_fell_back', { app: externalFellBack })}
+            onDismiss={() => setExternalFellBack(null)}
+            testId="files-home-external-terminal-fallback"
+          />
         </div>
       )}
       <div className="flex-1 min-h-0 flex">
