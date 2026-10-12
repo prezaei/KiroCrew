@@ -2125,21 +2125,29 @@ their own change: for every command in the input and in every nested shell paylo
 the program that runs, and does its mode operand grant all nine permission bits?** The
 words are read the way the shell and then `chmod` read them. A redirection is the
 shell's and never reaches `chmod` — `2>/dev/null`, `>file`, `&>/dev/null`, `2>&1`, and
-any operator with no target in its own word (a bare `>`, `2>`, or one glued to the end
-of an option or of the program word: `--recursive> /dev/null`, `chmod> /dev/null`) takes
+any operator with no target in its own word (a bare `>`, `2>`, one glued to the end
+of an option or of the program word: `--recursive> /dev/null`, `chmod> /dev/null`, and a
+chain whose LAST operator is open: `2>&1> /dev/null`) takes
 the NEXT word as its target — so `chmod -R --recursive> /dev/null 777 ~` hands `chmod` a
-`777` mode. Each word is then brace-expanded as bash expands it before `chmod` runs
-(`_expand_braces`: `{00777,0755}` is two words with `00777` first, `{0..0}0777` is
-`00777`, `{state}` and `${x}` stay literal; past 64 words the reader refuses rather than
-enumerates). Of what remains, options are recognised by shape at any position, since
+`777` mode. Each word is then brace-expanded as bash expands it before `chmod` runs,
+through the package's one expander, `argv_floor._brace_expansions` (it fails closed
+past its cap). That expander resolves nested groups innermost-first, so its word
+ORDER can differ from bash's; the floor therefore never lets order decide: while the
+mode position is open, a brace word ANY of whose words would grant is refused
+(`{00777,0755}`, and over-strictly `{755,777}`). A word past the expander's cap is
+refused only where it could still be the mode; a file list past the cap (`chmod 644
+-- {1..300}`) is files. Of what remains, options are recognised by shape at any position, since
 GNU `chmod` permutes them; `--` ends them; a `-`-led MODE word (`-x`, `-w,+777`,
 `-+777` — `_is_dash_mode`) is the mode and turns every operand into a file, so `chmod
 -x *` removes a bit from the files and is allowed; `--reference` (or an unambiguous
 abbreviation) means the command has no mode operand; otherwise the first operand is the
 mode. **Both readings are taken, GNU's and BSD's, and either grant refuses**: BSD
-`chmod` (macOS) stops reading options at the first operand, so `chmod -v 777
---reference=t f` and `chmod -v 777 -x f` set `777` there whatever GNU makes of them, and
-the gate cannot know which binary the line reaches. The gate lowercases text before the
+`chmod` (macOS) does not permute, and its `getopt` (`HLPRXfghorstuvwx`, FreeBSD
+`bin/chmod/chmod.c`) also stops at a mode letter inside a cluster, taking the NEXT word
+as the mode when that letter ends the cluster (`_bsd_mode_candidates`). So `chmod -v
+777 --reference=t f`, `chmod -v 777 -x f` and `chmod -Rw 777 f` set `777` there, and
+the gate cannot know which binary the line reaches. The BSD reading comes from that
+source and was not measured on a BSD or macOS host. The gate lowercases text before the
 floor sees it, so `-r` is read as the option `-R` (keeping the next operand as the
 mode, the fail-closed choice) unless more mode characters follow (`-rw`, `-rwx,+777`).
 
@@ -2151,8 +2159,12 @@ right — `+777` adds, `=777` sets, `-777` removes, and `=600,+777`, `+07,+0770`
 all end at `777`. Octal after a who letter (`u=777`), a second action after a digit run
 (`+7+70`), an empty clause (`777,`) and a bare number inside a list (`u+x,777`) are
 INVALID and change nothing. A letter action is the symbolic grammar the issue leaves
-alone and contributes nothing — not even a removal, so `=777,u-w` is read as a grant (the
-fail-closed over-read). A mode word that is still a pathname glob after brace expansion
+alone, and only its CERTAIN narrowing is applied (`_symbolic_narrowing`): with an
+explicit who, `-` clears the named `r`/`w` bits and `=` clears the `r`/`w` bits the
+letters do not name, so `=777,go-w` reads `755` and `=777,o=rx` reads `775` (measured).
+A who-less action depends on the umask, `x` may be a lowercased `X`, and a copy letter
+depends on the file, so none of those clears anything — `=777,a-x` is read as a grant,
+the fail-closed over-read — and a letter GRANT adds nothing, the symbolic residual. A mode word that is still a pathname glob after brace expansion
 (`7?7`) is refused: the filesystem decides it. A glued control operator ends the argv
 and leaves its head to `chmod` (`chmod -R 777;ls` sets `777`); a same-line assignment is
 resolved by the reader (`m=777; chmod -R $m ~` is refused).
@@ -2161,7 +2173,8 @@ resolved by the reader (`m=777; chmod -R $m ~` is refused).
 the shell reader's data-consumer vocabulary (`_DATA_CONSUMER_PROGRAMS`): a word in
 program position, or owned by a program that EXECUTES its arguments — `sudo`, `env`,
 `nice`, `time`, `command`, `exec`, `xargs`, `find -exec`, `busybox`, `docker exec`, and
-any wrapper nobody enumerated — is read as the invocation; a word owned by a data
+any wrapper nobody enumerated — is read as the invocation; a `chmod` word owned by a
+`chmod` is that command's file operand (`chmod 755 -- chmod 0777` sets 755); a word owned by a data
 consumer is that program's data, and the words after it are that program's, not a mode
 (`grep -rn chmod src/`, `ls -l /bin/chmod`, `rg -n chmod *`, `sed -i 's/chmod -R 777/…/'
 f`). The WHOLE consumer vocabulary is used here, not the narrower set the inert-mention
@@ -2190,8 +2203,12 @@ own that refused every commit message, spec bullet and fixture that names a flag
 spelling (`git commit -F - <<'EOF'`, `git commit -m "$(cat <<'EOF' …)"`, `cat >> spec.md
 <<'EOF'`, `tee fixture.txt <<'EOF'` — measured by the security-scope lane). So this floor
 alone sets the body aside (`_without_data_heredoc_body`) when the frame holds exactly one
-heredoc, its consumer reads stdin as data (`_DATA_CONSUMER_PROGRAMS` minus `sed`, `awk`,
-`less`, `more`, plus `git` and `gh`), and nothing in any frame can run printed text
+heredoc operator that is UNQUOTED in the raw text (`_active_heredoc_openers`, through the
+shared quote state machine — a `<<` inside quotes opens nothing, so the next line is a
+command), its consumer reads stdin as data (`_reads_heredoc_as_data`:
+`_DATA_CONSUMER_PROGRAMS` minus `sed`, `awk`, `less`, `more`, plus `git` and `gh` through
+a BUILTIN subcommand only — an alias may be `!sh`, and neither tool lets an alias shadow
+a builtin), a closing tag line exists, and nothing in any frame can run printed text
 (`_can_run_printed_text`): no shell, `eval`, `source`, `.` or `xargs`, and no expansion in
 program position or under a program outside that vocabulary. `cat <<EOF | bash`,
 `sudo "$(cat <<EOF …)"`, `m=$(cat <<EOF …); $m` and `sed -f - <<EOF` keep the body as
@@ -2219,7 +2236,11 @@ package, as it is at program position; a glob or expansion in the PROGRAM word
 (`ch?od`, `${X}mod`) names a command the filesystem or environment decides; and a mode
 change inside an interpreter payload (`os.chmod(…, 0o777)`) is not a shell argv. A
 `bash -c` named in prose inside a read-only heredoc is still descended by the shared walk
-and refused, over-strictly. The regex row's own prefix quirk (`chmod 7770` matches the
+and refused, over-strictly. A nested payload that grows past its parent once `$HOME` is
+expanded (`bash -c "chmod -Rv 777 '$HOME'"` on a host with a long home path) is skipped by
+the shared walk's length bound; the regex row still refuses the literal spelling there.
+A command inside a `git -c 'alias.x=!…'` VALUE is one config word the walk does not
+descend. Both shared-walk readings and the alias value are tracked in #19588. The regex row's own prefix quirk (`chmod 7770` matches the
 literal) is the row's, not the floor's, and is left as it is.
 
 ### Sanctioned read channels over fenced data
