@@ -128,7 +128,7 @@ from .shell_normalizer import (
     _strip_redirect,
     _substitution_bodies,
     _substitution_depth_delta,
-    _xargs_here_string_rebuild,
+    _xargs_here_string_feeds,
 )
 from .vocabulary import _KILL_BY_NAME_PROGRAMS, _SELF_FILE_DELIVERY_VERBS, _SELF_NAME_RE
 
@@ -3199,15 +3199,23 @@ def _is_ssh_to_self(text_lower: str) -> bool:
                 continue
             # round-35 (GPT): launched through xargs, the verb's REAL argv
             # arrives on stdin -- and a here-string puts that stdin in the
-            # source text, so ``xargs ssh <<< localhost`` runs
-            # ``ssh localhost``.  Rebuild that command and judge it like a
-            # directly-typed one; the rebuild drops the xargs word and the
-            # here-string pair, so the recursion walks strictly fewer tokens
-            # and terminates.
-            if xargs_prefix_index is not None and xargs_prefix_index < i:
-                rebuilt = _xargs_here_string_rebuild(verb, tokens, xargs_prefix_index, i)
-                if rebuilt is not None and _is_ssh_to_self(rebuilt):
-                    return True
+            # source text, so ``xargs ssh <<< localhost`` runs ``ssh localhost``.
+            # WHICH record of that stdin reaches the verb is decided by quoting,
+            # redirection provenance (an overriding ``0<<<``, a quoted ``<<<``
+            # that is data) and xargs's own record-splitting options (a
+            # delimiter, NUL input, a count, a size, a replace marker) -- more
+            # than a text check can model with certainty.  So the destination is
+            # UNKNOWN whenever a here-string feeds the launcher: fail closed on
+            # any here-string-fed xargs that launches an ssh-family verb, rather
+            # than rebuilding one spelling of it.  (``xargs`` fed by a PIPE is
+            # not in the source text, so it is not judged here, as before.)  The
+            # interim tier is deleted whole when the #9806 network fence lands.
+            if (
+                xargs_prefix_index is not None
+                and xargs_prefix_index < i
+                and _xargs_here_string_feeds(tokens, xargs_prefix_index)
+            ):
+                return True
             # rsync execs a pending ``RSYNC_RSH`` / ``RSYNC_CONNECT_PROG``
             # value as its remote shell (or daemon proxy) FROM HERE, so a
             # value that opens a channel to this host is a self dial.

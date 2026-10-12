@@ -9054,13 +9054,15 @@ class TestSandboxEscapeSshSelf:
         assert _denied_by("ssh local$(printf host) id") == self._RULE
         assert _denied_by("ssh $(printf remote.example.com) id") is None
 
-    def test_here_string_fed_xargs_is_judged_as_the_rebuilt_command(self):
-        # round-35 (GPT): bash strips ``<<< word`` from argv and delivers the
-        # word on stdin, and xargs turns stdin into ARGUMENTS for the verb it
-        # launches -- so ``xargs ssh <<< localhost`` reaches ``ssh localhost``.
-        # The floor rebuilds that command from the statically-known pieces and
-        # judges it; a far host stays allowed, and stdin that only exists at
-        # run time (a pipe) stays the documented run-time residual.
+    def test_here_string_fed_xargs_fails_closed(self):
+        # An ``xargs`` fed by a here-string launches an ssh-family verb whose
+        # argv it builds from that stdin at run time.  WHICH record of the
+        # stdin reaches the verb is decided by quoting, redirection provenance
+        # and xargs's own record-splitting options -- more than a text check
+        # can model with certainty -- so the destination is unknown and the
+        # floor fails closed on ANY here-string-fed xargs that launches an
+        # ssh-family verb, far host or self alike.  (A PIPE-fed xargs is a
+        # separate path, judged as before; see the far-host pipe case below.)
         assert _denied_by("xargs ssh <<< localhost") == self._RULE
         assert _denied_by("xargs ssh <<<localhost") == self._RULE
         assert _denied_by("xargs -I{} ssh {} <<< localhost") == self._RULE
@@ -9069,9 +9071,39 @@ class TestSandboxEscapeSshSelf:
         assert _denied_by("<<< localhost xargs ssh") == self._RULE
         assert _denied_by("<<< localhost sudo xargs ssh") == self._RULE
         assert _denied_by("xargs -I{} ssh user@{} <<< localhost") == self._RULE
-        assert _denied_by("<<< far.example.com xargs ssh") is None
-        assert _denied_by("xargs -I{} ssh user@{} <<< far.example.com") is None
-        assert _denied_by("xargs ssh <<< remote.example.com") is None
+        # A far host fed by a here-string now fails closed too: the launcher
+        # could still assemble a self dial from the same text, so the earlier
+        # per-record modelling is not trusted (it carried a defect; see below).
+        assert _denied_by("<<< far.example.com xargs ssh") == self._RULE
+        assert _denied_by("xargs -I{} ssh user@{} <<< far.example.com") == self._RULE
+        assert _denied_by("xargs ssh <<< remote.example.com") == self._RULE
+
+    def test_here_string_fed_xargs_with_overriding_stdin_fails_closed(self):
+        # Reported cases where modelling which here-string becomes stdin let a
+        # self dial through: a later redirection (``0<<<``) overrides the
+        # earlier one, and a quoted ``<<<`` is DATA, not a redirect, so bash
+        # still delivers ``localhost`` while a per-record rebuild had picked the
+        # trailing ``far-host``.  Failing closed on the mere PRESENCE of a
+        # here-string refuses all of them without parsing provenance.
+        assert _denied_by("xargs -i ssh {} id <<< localhost '<<<far-host'") == self._RULE
+        assert (
+            _denied_by("xargs -i ssh {} id <<< localhost <<< far-host 0<<< localhost") == self._RULE
+        )
+        assert _denied_by("xargs -i ssh {} id <<< localhost <<< far-host") == self._RULE
+        # Record-splitting options cannot be used to smuggle a self record past
+        # a single-record reading either -- the whole shape fails closed.
+        assert _denied_by("xargs -d, -I{} ssh {} <<< '-V,localhost,'") == self._RULE
+        assert _denied_by("xargs -0 -I{} ssh {} <<< localhost") == self._RULE
+        assert _denied_by("xargs -L1 ssh <<< 'far-host localhost'") == self._RULE
+
+    def test_pipe_fed_xargs_is_the_documented_residual(self):
+        # The here-string fail-closed does not change the PIPE path: a pipe's
+        # stdin is not in the source text, so a far-host pipe stays allowed as
+        # on main (the run-time residual the #9806 fence closes), while a
+        # self-host pipe is refused by the existing pipe rebuild.
+        assert _denied_by("echo far.example.com | xargs ssh") is None
+        assert _denied_by("echo remote.example.com | xargs ssh") is None
+        assert _denied_by("echo localhost | xargs ssh") == self._RULE
 
     def test_plain_redirects_still_consume_their_filename(self):
         # The here-string handling must not widen the redirect branch: a
