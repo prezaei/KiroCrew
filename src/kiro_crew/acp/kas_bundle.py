@@ -90,7 +90,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "KAS_BUNDLE_ENGINES_LEAF",
-    "KAS_BUNDLE_LATEST_NAME",
     "KAS_BUNDLE_MANIFEST_NAME",
     "ArtifactRef",
     "InstalledKasBundle",
@@ -113,8 +112,11 @@ __all__ = [
 KAS_BUNDLE_ENGINES_LEAF = "engines"
 
 #: Object names under ``<base>/kas/`` on the publishing host.
-KAS_BUNDLE_LATEST_NAME = "latest.json"
 KAS_BUNDLE_MANIFEST_NAME = "manifest.json"
+
+#: npm scopes a package name with "/" ("@kiro/agent"); that is npm's separator,
+#: not a filesystem path, and node_modules nests one directory per segment.
+_NPM_SCOPE_SEP = "/"
 
 #: The engine's stdio ACP server, relative to the extracted bundle. Read from the
 #: package's own ``bin`` map when present; this is the fallback and the check.
@@ -294,11 +296,10 @@ def _require_https(url: str, *, what: str) -> None:
         )
 
 
-def manifest_url_for(base_url: str, version: str | None) -> str:
-    """``<base>/kas/<version>/manifest.json``, or the ``latest.json`` pointer when unpinned."""
+def manifest_url_for(base_url: str, version: str) -> str:
+    """``<base>/kas/<version>/manifest.json``. Every caller names a version: the
+    harness runs the release's pin, so there is no "current" pointer to follow."""
     base = base_url.rstrip("/")
-    if version is None:
-        return f"{base}/kas/{KAS_BUNDLE_LATEST_NAME}"
     if not _VERSION_RE.match(version):
         raise KasBundleError(f"bad version {version!r}")
     return f"{base}/kas/{version}/{KAS_BUNDLE_MANIFEST_NAME}"
@@ -329,28 +330,20 @@ def _read_json_url(url: str, opener: Any, *, sha256: str | None = None) -> Any:
 def fetch_manifest(
     base_url: str,
     *,
-    version: str | None = None,
+    version: str,
     sha256: str | None = None,
     opener: Any | None = None,
 ) -> tuple[KasBundleManifest, str]:
-    """Resolve and fetch the manifest; return it with the url it came from.
+    """Fetch ``<base>/kas/<version>/manifest.json``; return it with the url it came from.
 
-    Without *version*, ``latest.json`` names the manifest to use (its ``manifest``
-    key is a path relative to *base_url*). With *sha256*, the manifest's raw bytes
-    must hash to it before anything is parsed. The returned url is what artifact
-    names are resolved beside.
+    With *sha256*, the manifest's raw bytes must hash to it before anything is
+    parsed. The returned url is what artifact names are resolved beside.
     """
     _require_https(base_url, what="KAS bundle base url")
     opener = opener or asset_downloader.build_opener()
     url = manifest_url_for(base_url, version)
-    if version is None:
-        pointer = _read_json_url(url, opener)
-        rel = pointer.get("manifest") if isinstance(pointer, Mapping) else None
-        if not isinstance(rel, str) or not rel or rel.startswith(("/", "\\")) or ".." in rel:
-            raise KasBundleError(f"{KAS_BUNDLE_LATEST_NAME} carries no usable 'manifest' path")
-        url = f"{base_url.rstrip('/')}/{rel.lstrip('/')}"
     manifest = parse_manifest(_read_json_url(url, opener, sha256=sha256))
-    if version is not None and manifest.version != version:
+    if manifest.version != version:
         raise KasBundleError(
             f"asked for KAS {version} but the manifest at that path says {manifest.version}"
         )
@@ -407,16 +400,19 @@ def _fetch_artifact(
             raise KasBundleError(err)
         return
 
+    # Copy FIRST, then verify the copy. Hashing the source and copying it
+    # afterwards is two reads of a file in a directory the installer does not
+    # own, and the bytes could change between them; the staged copy is in the
+    # gateway-owned staging directory, so what is hashed is what is extracted.
     src = Path(source) / ref.file
     if not src.is_file():
         raise KasBundleError(f"{label}: {src} is not a file")
-    if src.stat().st_size != ref.size:
-        raise KasBundleError(
-            f"{label}: {src} is {src.stat().st_size} bytes, manifest says {ref.size}"
-        )
-    if _sha256_file(src) != ref.sha256:
-        raise KasBundleError(f"{label}: sha256 of {src} does not match the manifest")
     shutil.copyfile(src, dest)
+    size = dest.stat().st_size
+    if size != ref.size:
+        raise KasBundleError(f"{label}: {src} is {size} bytes, manifest says {ref.size}")
+    if _sha256_file(dest) != ref.sha256:
+        raise KasBundleError(f"{label}: sha256 of {src} does not match the manifest")
     if on_progress is not None:
         on_progress(label, ref.size, ref.size)
 
@@ -476,7 +472,7 @@ def _extract_archive(archive: Path, into: Path) -> None:
 
 
 def _locate_acp_server(bundle_dir: Path, package: str) -> Path:
-    pkg_dir = bundle_dir / "node_modules" / Path(*package.split("/"))
+    pkg_dir = bundle_dir / "node_modules" / Path(*package.split(_NPM_SCOPE_SEP))
     rel = _ACP_SERVER_REL
     pkg_json = pkg_dir / "package.json"
     if pkg_json.is_file():
@@ -581,12 +577,10 @@ def install_bundle(
     node_ref = manifest.node_for(node_key)
 
     final = root / manifest.version
-    if final.exists():
-        if not force:
-            raise KasBundleError(
-                f"KAS {manifest.version} is already installed at {final} (use --force to replace it)"
-            )
-        shutil.rmtree(final)
+    if final.exists() and not force:
+        raise KasBundleError(
+            f"KAS {manifest.version} is already installed at {final} (use --force to replace it)"
+        )
 
     root.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}{manifest.version}-", dir=root))
@@ -633,7 +627,34 @@ def install_bundle(
                 "node_bin": node_bin.relative_to(staging).as_posix(),
             },
         )
-        platform_compat.publish_dir_noreplace(staging, final)
+        # Only now, with the replacement fetched, verified and probed, does an
+        # existing directory at this version go, and only on --force: a fetch,
+        # extraction or probe failure above leaves the working engine untouched.
+        # The old tree is moved aside first so the publish rename has an absent
+        # target; it is removed after the rename and restored if the rename fails.
+        # Without --force nothing is retired: a directory that appeared since the
+        # check at the top is a concurrent install of the same version that won,
+        # and the no-replace publish turns that into a refusal, never a swap.
+        retired: Path | None = None
+        if force and final.exists():
+            retired = Path(tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}retired-", dir=root))
+            retired.rmdir()
+            os.rename(final, retired)
+        try:
+            platform_compat.publish_dir_noreplace(staging, final)
+        except FileExistsError as exc:
+            if retired is not None and not final.exists():
+                os.rename(retired, final)
+            raise KasBundleError(
+                f"KAS {manifest.version} was installed by another process while this "
+                f"install ran; it is at {final} (re-run with --force to replace it)"
+            ) from exc
+        except BaseException:
+            if retired is not None and not final.exists():
+                os.rename(retired, final)
+            raise
+        if retired is not None:
+            shutil.rmtree(retired, ignore_errors=True)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -699,6 +720,9 @@ def installed_bundle(
     try:
         home = root / version
         record = json.loads((home / _INSTALL_RECORD_NAME).read_text(encoding="utf-8"))
+        if not isinstance(record, Mapping):
+            logger.warning("KAS bundle record for %s is not an object; ignoring it", version)
+            return None
         acp_rel = record.get("acp_server")
         node_rel = record.get("node_bin")
         node_version = record.get("node_version")
